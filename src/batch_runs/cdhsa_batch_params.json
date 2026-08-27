@@ -1,0 +1,43 @@
+{
+  "experiment_label": "multiss_cdhsa_5ss_2tasks",
+  "_comment_experiment": "CD-HSA en modo multi-SS: los 5 super-sujetos juntos (S=5) con 2 tareas (C=2). CD-HSA encuentra modos comunes entre SS y modos especificos por tarea con soporte estadistico cross-subject.",
+
+  "super_subjects": {
+    "n_super_subjects": 5,
+    "subjects_per_super_subject": 12,
+    "subject_start_offset": 1,
+    "total_subjects": 60
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "music"],
+
+  "time_window": {
+    "t_start": 100.0,
+    "t_end": 100.5,
+    "_comment": "Ventana temporal POR SUJETO. Con t_end=200 y 12 subjects, cada SS tiene 2400s. Requiere ~256GB RAM con L=10 y depth=10."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 20,
+    "rank_method": "fixed",
+    "a6_n_null": 500,
+    "bc_n_perm": 5000,
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "d_max_specific": 4
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4
+  }
+}
