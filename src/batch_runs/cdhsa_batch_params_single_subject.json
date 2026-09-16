@@ -1,0 +1,42 @@
+{
+  "experiment_label": "singlesubject_cdhsa_60sub_2tasks",
+  "_comment_experiment": "CD-HSA sobre sujetos individuales: S=60 sujetos (sin concatenar) con C=2 tareas. El metodo es identico; solo cambia la construccion de X[s][c].",
+
+  "subjects": {
+    "n_subjects": 60,
+    "subject_start_offset": 1,
+    "_comment": "Alternativa: 'subject_ids': [1, 2, ..., 60] para lista explicita."
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "music"],
+
+  "time_window": {
+    "t_start": 100.0,
+    "t_end": 200.0,
+    "_comment": "Ventana temporal POR SUJETO (segundos)."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 20,
+    "rank_method": "fixed",
+    "a6_n_null": 500,
+    "bc_n_perm": 5000,
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "d_max_specific": 4
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4
+  }
+}
