@@ -1,70 +1,65 @@
 #!/usr/bin/env python3
 """
-run_batch_cdhsa.py
-====================
-Batch executor for the **CD-HSA** pipeline.
+run_batch_cdhsa_single_subject.py
+==================================
+Batch executor for the **CD-HSA single-subject** pipeline.
 
-Supports two execution modes controlled by the JSON configuration:
+Single execution mode::
 
-**Multi-SS mode** (recommended, new)::
+  One job per session.  ALL individual subjects are passed together to
+  a single invocation of ``run_cdhsa_single_subject.py`` (S=n_subjects,
+  C=tasks).  CD-HSA finds common directions across subjects AND
+  condition-specific modes with full cross-subject statistical support
+  (permutation tests, prevalence, A6 rank).
 
-  A single invocation of ``run_cdhsa.py`` with all super-subjects
-  together (S=N, C=tasks).  CD-HSA finds common directions across
-  subjects AND condition-specific modes with full cross-subject
-  statistical support (permutation tests, prevalence, A6 rank).
-
-  Triggered when ``super_subjects.n_super_subjects`` is present.
-
-**Per-SS mode** (legacy)::
-
-  Iterates over super-subjects and dispatches each as a subprocess
-  call to ``run_cdhsa.py`` with ``--super-subject-id`` (S=1).
-
-  Triggered when ``super_subjects.selected`` is present.
+  There is no per-SS mode here (each subject IS its own sample).
 
 Configuration
 --------------
 Everything is controlled by the JSON file (default:
-``./cdhsa_batch_params.json``).
+``./cdhsa_batch_params_single_subject.json``).
 
-Multi-SS JSON example::
+JSON example::
 
     {
-      "experiment_label": "multiss_cdhsa_5ss_5tasks",
-      "super_subjects": {
-          "n_super_subjects": 5,
-          "subjects_per_super_subject": 12,
-          "subject_start_offset": 1,
-          "total_subjects": 60
+      "experiment_label": "singlesubject_cdhsa_60sub_2tasks",
+      "subjects": {
+          "n_subjects": 60,
+          "subject_start_offset": 1
       },
       "sessions": ["session1"],
-      "tasks": ["eyesclosed", "eyesopen", "music", "memory", "mathematic"],
-      "time_window": { "t_start": 0.0, "t_end": 300.0 },
+      "tasks": ["eyesclosed", "music"],
+      "time_window": { "t_start": 100.0, "t_end": 200.0 },
       "cdhsa_params": {
-          "L": 27, "hankel_depth": 10,
+          "L": 10, "hankel_depth": 10,
           "l_freq": 1.0, "h_freq": 40.0,
-          "fixed_rank": 25, "rank_method": "fixed",
+          "fixed_rank": 20, "rank_method": "fixed",
           "a6_n_null": 500, "bc_n_perm": 5000,
-          "skip_bc": false, "skip_tangent": false, "skip_d": false
+          "skip_bc": false, "skip_tangent": false, "skip_d": false,
+          "d_max_specific": 4
       },
       "execution": {
           "max_workers": 1, "delay": 0.0,
-          "run_comparison": false
+          "run_comparison": false, "mode_extract_top_n": 4
       }
     }
 
+  Alternative ``subjects`` block: ``{"subject_ids": [1, 2, ..., 60]}``
+  for an explicit subject list.
+
 Usage
 -----
-From the directory containing this script::
+From the repository root (with ``.env`` configured)::
 
-    # Defaults (reads cdhsa_batch_params.json in the same directory)
-    python run_batch_cdhsa.py
+    # Defaults (reads cdhsa_batch_params_single_subject.json next to this script)
+    python src/batch_runs/run_batch_cdhsa_single_subject.py
 
     # Custom JSON
-    python run_batch_cdhsa.py --params-json /path/to/params.json
+    python src/batch_runs/run_batch_cdhsa_single_subject.py --params-json /path/to/params.json
 
     # Override via environment variable
-    BATCH_CDHSA_PARAMS_JSON=/path/to/params.json python run_batch_cdhsa.py
+    BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON=/path/to/params.json \\
+        python src/batch_runs/run_batch_cdhsa_single_subject.py
 """
 
 from __future__ import annotations
@@ -96,7 +91,7 @@ except ImportError:
     _HAS_MEM_TRACKER = False
 
 # ---------------------------------------------------------------------------
-# Ensure the directory containing run_cdhsa.py is importable
+# Ensure the directory containing the pipeline scripts is importable
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -110,12 +105,12 @@ logging.basicConfig(
     format="[%(asctime)s] %(levelname)-8s %(message)s",
     datefmt="%H:%M:%S",
 )
-logger = logging.getLogger("batch_cdhsa")
+logger = logging.getLogger("batch_cdhsa_single_subject")
 
 # ---------------------------------------------------------------------------
 # Default JSON path
 # ---------------------------------------------------------------------------
-DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params.json"
+DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_single_subject.json"
 
 # ---------------------------------------------------------------------------
 # JSON loading + validation
@@ -132,43 +127,32 @@ def _load_params(json_path: Path) -> dict:
         params = json.load(fh)
 
     # Minimal validation
-    required_top_keys = ["super_subjects", "sessions", "tasks", "cdhsa_params"]
+    required_top_keys = ["subjects", "sessions", "tasks", "cdhsa_params"]
     for key in required_top_keys:
         if key not in params:
             logger.error("Falta la clave requerida '%s' en el JSON", key)
             sys.exit(1)
 
-    ss_cfg = params["super_subjects"]
+    subj_cfg = params["subjects"]
 
-    # Detect mode: multi-SS (n_super_subjects) vs per-SS (selected)
-    is_multi_ss = "n_super_subjects" in ss_cfg
-    is_per_ss = "selected" in ss_cfg
+    # The subjects block must declare either an explicit list or a count
+    has_ids = "subject_ids" in subj_cfg
+    has_n = "n_subjects" in subj_cfg
 
-    if not is_multi_ss and not is_per_ss:
+    if not has_ids and not has_n:
         logger.error(
-            "El bloque 'super_subjects' debe contener 'n_super_subjects' (modo multi-SS) "
-            "o 'selected' (modo per-SS legacy)."
+            "El bloque 'subjects' debe contener 'n_subjects' "
+            "(rango automatico) o 'subject_ids' (lista explicita)."
         )
         sys.exit(1)
 
-    if is_per_ss:
-        if not isinstance(ss_cfg["selected"], list) or not ss_cfg["selected"]:
-            logger.error("'super_subjects.selected' debe ser una lista no vacia.")
+    if has_ids:
+        if not isinstance(subj_cfg["subject_ids"], list) or not subj_cfg["subject_ids"]:
+            logger.error("'subjects.subject_ids' debe ser una lista no vacia.")
             sys.exit(1)
-        # If 'groups' is not provided, 'subjects_per_super_subject' must be set
-        if "groups" not in ss_cfg:
-            if "subjects_per_super_subject" not in ss_cfg:
-                logger.error(
-                    "Se requiere 'subjects_per_super_subject' cuando 'groups' "
-                    "no esta definido en 'super_subjects'."
-                )
-                sys.exit(1)
     else:
-        # multi-SS mode
-        if "total_subjects" not in ss_cfg:
-            logger.error(
-                "En modo multi-SS, 'super_subjects.total_subjects' es requerido."
-            )
+        if not isinstance(subj_cfg["n_subjects"], int) or subj_cfg["n_subjects"] <= 0:
+            logger.error("'subjects.n_subjects' debe ser un entero positivo.")
             sys.exit(1)
 
     # Validate cdhsa_params
@@ -185,37 +169,30 @@ def _load_params(json_path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def _super_subject_label(super_subject_id: int) -> str:
-    """BIDS-style label, e.g. ``super_subject-01``."""
-    return f"super_subject-{super_subject_id:02d}"
-
-
-def _resolve_subject_ids_for_job(
-    super_subject_id: int, ss_cfg: dict,
-) -> list[int] | None:
-    """Resolve the explicit subject-ids for a super-subject, or None
-    if the auto-resolution should be delegated to the pipeline.
+def _resolve_subject_ids(subj_cfg: dict) -> list[int]:
+    """Resolve the explicit subject-id list from the ``subjects`` block.
 
     Returns
     -------
-    list[int] | None
-        * ``None`` when the JSON does not declare a ``groups`` block;
-          the pipeline will auto-resolve from
-          ``subjects_per_super_subject`` + ``subject_start_offset``.
-        * A list of subject indices when ``groups`` is declared.
+    list[int]
+        * ``subject_ids`` as-is when the JSON declares it;
+        * otherwise ``range(offset, offset + n_subjects)``.
     """
-    groups = ss_cfg.get("groups")
-    if groups is None:
-        return None
+    if "subject_ids" in subj_cfg:
+        return [int(x) for x in subj_cfg["subject_ids"]]
+    offset = int(subj_cfg.get("subject_start_offset", 1))
+    n = int(subj_cfg["n_subjects"])
+    return list(range(offset, offset + n))
 
-    # JSON object keys are strings -> coerce to int when possible
-    key = super_subject_id if super_subject_id in groups else str(super_subject_id)
-    if key not in groups:
-        raise KeyError(
-            f"super_subject_id={super_subject_id} not in groups "
-            f"(keys: {list(groups.keys())})"
-        )
-    return [int(x) for x in groups[key]]
+
+def _subjects_label(job: dict) -> str:
+    """Short label for the job's subject pool, e.g. ``nSub60`` or
+    ``subj_1-60``."""
+    ids = job["subject_ids"]
+    n = job["n_subjects"]
+    if ids == list(range(ids[0], ids[0] + n)):
+        return f"nSub{n}"
+    return f"subj_{ids[0]}-{ids[-1]}"
 
 
 # ===========================================================================
@@ -226,65 +203,32 @@ def _resolve_subject_ids_for_job(
 def _generate_jobs(params: dict) -> list[dict]:
     """Generate the list of jobs from the JSON parameters.
 
-    **Multi-SS mode** (``n_super_subjects`` in JSON):
-        One job per session.  All super-subjects are passed together
-        to a single invocation of ``run_cdhsa.py`` (S=N, C=tasks).
-
-    **Per-SS mode** (``selected`` in JSON, legacy):
-        One job per (super-subject, session) pair (S=1 each).
+    Single mode (``single_subject``): one job per session.  All
+    individual subjects are passed together to a single invocation of
+    ``run_cdhsa_single_subject.py`` (S=n_subjects, C=tasks).
     """
-    ss_cfg = params["super_subjects"]
+    subj_cfg = params["subjects"]
     sessions = params["sessions"]
     tasks = params["tasks"]
-    tw = params["time_window"]
+    tw = params.get("time_window", {})
     cdhsa = params["cdhsa_params"]
-    t_start = str(tw["t_start"])
-    t_end = str(tw["t_end"])
+    t_start = str(tw.get("t_start"))
+    t_end = str(tw.get("t_end"))
+
+    subject_ids = _resolve_subject_ids(subj_cfg)
 
     jobs: list[dict] = []
-
-    # --- Multi-SS mode ---
-    if "n_super_subjects" in ss_cfg:
-        n_ss = ss_cfg["n_super_subjects"]
-        for session in sessions:
-            jobs.append({
-                "mode": "multi_ss",
-                "n_super_subjects": n_ss,
-                "subjects_per_super_subject": ss_cfg.get("subjects_per_super_subject"),
-                "subject_start_offset": ss_cfg.get("subject_start_offset", 1),
-                "total_subjects": ss_cfg["total_subjects"],
-                "session": session,
-                "tasks": tasks,
-                "cdhsa_params": cdhsa,
-                "ss_cfg": ss_cfg,
-                "t_start": t_start,
-                "t_end": t_end,
-            })
-        return jobs
-
-    # --- Per-SS mode (legacy) ---
-    selected_ids: list[int] = list(ss_cfg["selected"])
-    for sid in selected_ids:
-        ss_label = _super_subject_label(sid)
-        try:
-            subject_ids = _resolve_subject_ids_for_job(sid, ss_cfg)
-        except KeyError as exc:
-            logger.error("%s -- este super-sujeto se omitira.", exc)
-            continue
-
-        for session in sessions:
-            jobs.append({
-                "mode": "per_ss",
-                "super_subject_id": sid,
-                "super_subject_label": ss_label,
-                "subject_ids": subject_ids,
-                "session": session,
-                "tasks": tasks,
-                "cdhsa_params": cdhsa,
-                "ss_cfg": ss_cfg,
-                "t_start": t_start,
-                "t_end": t_end,
-            })
+    for session in sessions:
+        jobs.append({
+            "mode": "single_subject",
+            "subject_ids": subject_ids,
+            "n_subjects": len(subject_ids),
+            "session": session,
+            "tasks": tasks,
+            "cdhsa_params": cdhsa,
+            "t_start": t_start,
+            "t_end": t_end,
+        })
     return jobs
 
 
@@ -293,13 +237,13 @@ def _generate_jobs(params: dict) -> list[dict]:
 # ===========================================================================
 
 
-class CDHSABatchRunner:
-    """Orchestrates batch execution of the CD-HSA pipeline."""
+class SingleSubjectCDHSABatchRunner:
+    """Orchestrates batch execution of the single-subject CD-HSA pipeline."""
 
-    DEFAULT_PIPELINE_MODULE = "src.pipelines.run_cdhsa"
+    DEFAULT_PIPELINE_MODULE = "src.pipelines.run_cdhsa_single_subject"
 
     CSV_FIELDS = [
-        "timestamp", "mode", "super_subject", "session", "tasks",
+        "timestamp", "mode", "subjects", "session", "tasks",
         "L", "fixed_rank", "hankel_depth",
         "t_start", "t_end", "success", "returncode",
         "elapsed_s", "command",
@@ -308,9 +252,10 @@ class CDHSABatchRunner:
     def __init__(self, params: dict, *, pipeline_script: Path | None = None,
                  pipeline_module: str | None = None) -> None:
         self.params = params
-        self.pipeline_script = pipeline_script or (_SCRIPT_DIR.parent / "pipelines" / "run_cdhsa.py")
+        self.pipeline_script = pipeline_script or (
+            _SCRIPT_DIR.parent / "pipelines" / "run_cdhsa_single_subject.py")
         self.pipeline_module = pipeline_module or self.DEFAULT_PIPELINE_MODULE
-        self.ss_cfg = params["super_subjects"]
+        self.subj_cfg = params["subjects"]
         self.exec_cfg = params.get("execution", {})
 
         # Execution settings
@@ -374,28 +319,26 @@ class CDHSABatchRunner:
             log_dir.mkdir(parents=True, exist_ok=True)
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        label = self.params.get("experiment_label", "batch_cdhsa")
-        return log_dir / f"batch_cdhsa_{label}_{ts}.csv"
+        label = self.params.get("experiment_label", "batch_cdhsa_single_subject")
+        return log_dir / f"batch_cdhsa_single_subject_{label}_{ts}.csv"
 
     # ------------------------------------------------------------------
     # Banner
     # ------------------------------------------------------------------
 
     def _print_banner(self) -> None:
-        is_multi_ss = any(j.get("mode") == "multi_ss" for j in self.all_jobs)
         n_sessions = len({j["session"] for j in self.all_jobs})
         n_tasks = len(self.params["tasks"])
         cdhsa = self.params["cdhsa_params"]
-        tw = self.params["time_window"]
+        tw = self.params.get("time_window", {})
+
+        first_job = self.all_jobs[0] if self.all_jobs else None
+        ids = first_job["subject_ids"] if first_job else []
+        n_subjects = first_job["n_subjects"] if first_job else 0
 
         logger.info("=" * 70)
-        if is_multi_ss:
-            n_ss = self.ss_cfg["n_super_subjects"]
-            spp = self.ss_cfg.get("subjects_per_super_subject")
-            logger.info("  BATCH CD-HSA -- MODO MULTI-SS (S=%d, C=%d)", n_ss, n_tasks)
-        else:
-            n_ss = len({j["super_subject_id"] for j in self.all_jobs})
-            logger.info("  BATCH CD-HSA -- MODO PER-SS (S=1 por job, %d SS)", n_ss)
+        logger.info("  BATCH CD-HSA -- MODO SINGLE-SUBJECT (S=%d, C=%d)",
+                    n_subjects, n_tasks)
         logger.info("=" * 70)
         logger.info("  Pipeline script : %s", self.pipeline_script)
         logger.info("  DB path         : %s", self.db_path or "(default)")
@@ -403,35 +346,14 @@ class CDHSABatchRunner:
         logger.info("  Cache dir       : %s", self.cache_dir)
         logger.info("  Checkpoint      : %s", self._checkpoint_path())
         logger.info("  ---")
-        if is_multi_ss:
-            logger.info("  Super-subjects  : %d", n_ss)
-            logger.info("  Subjects/SS     : %d (offset %d)",
-                        spp, self.ss_cfg.get("subject_start_offset", 1))
-            logger.info("  Total subjects  : %d", self.ss_cfg["total_subjects"])
-        else:
-            logger.info(
-                "  Super-subjects  : %d  -> %s",
-                n_ss, sorted({j["super_subject_id"] for j in self.all_jobs}),
-            )
-            if "groups" in self.ss_cfg:
-                logger.info("  Groups mode     : explicit (groups block in JSON)")
-                for sid in self.ss_cfg["selected"]:
-                    ids = _resolve_subject_ids_for_job(sid, self.ss_cfg)
-                    logger.info(
-                        "    %s -> %d subjects [%d..%d]",
-                        _super_subject_label(sid), len(ids or []),
-                        (ids or [0])[0], (ids or [0])[-1],
-                    )
-            else:
-                logger.info(
-                    "  Auto-resolve    : %d subjects per super-subject (offset %d)",
-                    self.ss_cfg.get("subjects_per_super_subject", 20),
-                    self.ss_cfg.get("subject_start_offset", 1),
-                )
+        logger.info("  Subjects (S)    : %d", n_subjects)
+        if ids:
+            logger.info("  Subject range   : %d..%d", ids[0], ids[-1])
         logger.info("  Sessions        : %s", self.params["sessions"])
         logger.info("  Tasks (C)       : %s", self.params["tasks"])
-        logger.info("  Time window     : %.1f s -> %.1f s (per subject)",
-                    tw["t_start"], tw["t_end"])
+        if tw:
+            logger.info("  Time window     : %.1f s -> %.1f s (per subject)",
+                        tw.get("t_start", 0.0), tw.get("t_end", 0.0))
         logger.info("  ---")
         logger.info("  CDHSA params    :")
         logger.info("    L              : %d", cdhsa["L"])
@@ -446,12 +368,13 @@ class CDHSABatchRunner:
         logger.info("    skip_tangent   : %s", cdhsa.get("skip_tangent", False))
         logger.info("    skip_d         : %s", cdhsa.get("skip_d", False))
         logger.info("  ---")
-        logger.info("  Total jobs      : %d", len(self.all_jobs))
+        logger.info("  Total jobs      : %d (%d sessions)", len(self.all_jobs), n_sessions)
         logger.info("  Delay           : %.1f s", self.delay)
         logger.info("  Max workers     : %d (%s)",
                     self.max_workers,
                     "paralelo" if self.max_workers > 1 else "secuencial")
-        logger.info("  Comparison      : %s", self.run_comparison)
+        logger.info("  Comparison      : %s (NO APLICA en modo single-subject)",
+                    self.run_comparison)
         logger.info("=" * 70)
 
     # ------------------------------------------------------------------
@@ -460,8 +383,8 @@ class CDHSABatchRunner:
 
     def _checkpoint_path(self) -> Path:
         if self.cache_dir:
-            return self.cache_dir / "batch_checkpoint_cdhsa.json"
-        return Path("./cache") / "batch_checkpoint_cdhsa.json"
+            return self.cache_dir / "batch_checkpoint_cdhsa_single_subject.json"
+        return Path("./cache") / "batch_checkpoint_cdhsa_single_subject.json"
 
     def _load_checkpoint(self) -> set[str]:
         cp = self._checkpoint_path()
@@ -491,13 +414,8 @@ class CDHSABatchRunner:
     def _checkpoint_key(job: dict) -> str:
         """Build a unique checkpoint key from a job dict."""
         tasks_str = "+".join(job["tasks"])
-        if job.get("mode") == "multi_ss":
-            return (f"multiss_{job['n_super_subjects']}|{job['session']}|"
-                    f"{tasks_str}|{job['t_start']}|{job['t_end']}")
-        else:
-            sid = job["super_subject_id"]
-            return (f"ss{sid:02d}|{job['session']}|{tasks_str}|"
-                    f"{job['t_start']}|{job['t_end']}")
+        return (f"singlesub_n{job['n_subjects']}|{job['session']}|"
+                f"{tasks_str}|{job['t_start']}|{job['t_end']}")
 
     # ------------------------------------------------------------------
     # CSV log
@@ -520,11 +438,8 @@ class CDHSABatchRunner:
                 writer = csv.DictWriter(fh, fieldnames=self.CSV_FIELDS)
                 writer.writerow({
                     "timestamp": datetime.now().isoformat(),
-                    "mode": job.get("mode", "per_ss"),
-                    "super_subject": job.get(
-                        "super_subject_label",
-                        f"multi-SS({job.get('n_super_subjects', '?')})"
-                    ),
+                    "mode": job.get("mode", "single_subject"),
+                    "subjects": _subjects_label(job),
                     "session": job["session"],
                     "tasks": "+".join(job["tasks"]),
                     "L": job["cdhsa_params"].get("L", ""),
@@ -549,10 +464,9 @@ class CDHSABatchRunner:
         for job in jobs:
             key = self._checkpoint_key(job)
             if key in self.checkpoint:
-                label = job.get("super_subject_label", "multi-SS")
                 logger.debug(
                     "SKIP (checkpoint): %s/%s",
-                    label, job["session"],
+                    _subjects_label(job), job["session"],
                 )
                 continue
             todo.append(job)
@@ -566,57 +480,30 @@ class CDHSABatchRunner:
     # ------------------------------------------------------------------
 
     def _build_command(self, job: dict) -> list[str]:
-        """Build the subprocess command for a CD-HSA job.
+        """Build the subprocess command for a single-subject CD-HSA job.
 
-        Multi-SS mode: ``--n-super-subjects`` (S=N, all SS together).
-        Per-SS mode:  ``--super-subject-id`` (S=1, legacy).
+        Always uses ``--subject-ids i1 i2 ...`` (S=n_subjects, all
+        individual subjects together).
         """
         cdhsa = job["cdhsa_params"]
-        ss_cfg = job["ss_cfg"]
 
         cmd = [
             sys.executable, "-m", self.pipeline_module,
             "--session", job["session"],
         ]
 
-        # --- Mode selection (mutually exclusive in run_cdhsa.py CLI) ---
-        if job.get("mode") == "multi_ss":
-            cmd.extend([
-                "--n-super-subjects", str(job["n_super_subjects"]),
-                "--total-subjects", str(job["total_subjects"]),
-            ])
-            if job.get("subjects_per_super_subject") is not None:
-                cmd.extend([
-                    "--subjects-per-super-subject",
-                    str(job["subjects_per_super_subject"]),
-                ])
-            if job.get("subject_start_offset", 1) != 1:
-                cmd.extend([
-                    "--subject-start-offset",
-                    str(job["subject_start_offset"]),
-                ])
-        else:
-            # Per-SS legacy
-            cmd.extend([
-                "--super-subject-id", str(job["super_subject_id"]),
-            ])
-            if job.get("subject_ids") is not None:
-                pass  # groups handled by pipeline
-            cmd.extend([
-                "--subjects-per-super-subject",
-                str(ss_cfg.get("subjects_per_super_subject", 20)),
-                "--subject-start-offset",
-                str(ss_cfg.get("subject_start_offset", 1)),
-            ])
+        # Subjects (explicit list, resolved from the JSON)
+        cmd.extend(["--subject-ids"] + [str(i) for i in job["subject_ids"]])
 
-        # Tasks (all in a single --tasks invocation, since run_cdhsa.py uses nargs='+')
+        # Tasks (all in a single --tasks invocation, since the pipeline
+        # uses nargs='+')
         cmd.extend(["--tasks"] + job["tasks"])
 
-        # Time window
-        cmd.extend([
-            "--t-start", job["t_start"],
-            "--t-end", job["t_end"],
-        ])
+        # Time window (only when defined in the JSON)
+        if job["t_start"] != "None":
+            cmd.extend(["--t-start", job["t_start"]])
+        if job["t_end"] != "None":
+            cmd.extend(["--t-end", job["t_end"]])
 
         # CD-HSA parameters
         cmd.extend([
@@ -651,14 +538,14 @@ class CDHSABatchRunner:
         return cmd
 
     # ------------------------------------------------------------------
-    # Output dir for a job (mirrors run_cdhsa.py _resolve_out_dir)
+    # Output dir for a job (mirrors run_cdhsa_single_subject.py _resolve_out_dir)
     # ------------------------------------------------------------------
 
     def _get_output_dir(self, job: dict) -> Path:
         """Return the directory where the pipeline saves results.
 
-        Mirrors the path scheme in ``run_cdhsa.py``'s ``_resolve_out_dir()``.
-        Multi-SS uses ``nSS{N}``, per-SS uses ``SS{id}``.
+        Mirrors the path scheme in ``run_cdhsa_single_subject.py``'s
+        ``_resolve_out_dir()``, using the ``nSub{N}`` label.
         """
         if not self.output_dir:
             return Path(".")
@@ -667,8 +554,8 @@ class CDHSABatchRunner:
         tw = {"t_start": job["t_start"], "t_end": job["t_end"]}
         tasks = job["tasks"]
 
-        t_start_tag = tw["t_start"] if tw["t_start"] != "None" else "any"
-        t_end_tag = tw["t_end"] if tw["t_end"] != "None" else "any"
+        t_start_tag = (f"{tw['t_start']}s" if tw["t_start"] != "None" else "any")
+        t_end_tag = (f"{tw['t_end']}s" if tw["t_end"] != "None" else "any")
 
         L = cdhsa["L"]
         fr = cdhsa.get("fixed_rank", 10)
@@ -676,21 +563,17 @@ class CDHSABatchRunner:
         bcn = cdhsa.get("bc_n_perm", 5000)
         l_freq = cdhsa.get("l_freq", 1.0)
         h_freq = cdhsa.get("h_freq", 40.0)
-        depth = cdhsa.get("hankel_depth", "auto")
+        depth = cdhsa.get("hankel_depth") or "auto"
 
-        if job.get("mode") == "multi_ss":
-            n_ss = job["n_super_subjects"]
-            ss_label = f"nSS{n_ss}"
-        else:
-            ss_label = f"SS{job['super_subject_id']}"
+        subj_label = f"nSub{job['n_subjects']}"
 
         out_dir = Path(
             f"{self.output_dir}/cdhsa/{job['session']}"
-            f"/{ss_label}_L{L}"
+            f"/{subj_label}_L{L}"
             f"_fr{fr}_a6n{a6n}_bcn{bcn}"
             f"/{l_freq}-{h_freq}Hz"
             f"_depth{depth}"
-            f"/from{t_start_tag}s_to{t_end_tag}s"
+            f"/from{t_start_tag}_to{t_end_tag}"
             f"_{'_'.join(tasks)}"
         )
         return out_dir
@@ -808,14 +691,13 @@ class CDHSABatchRunner:
         try:
             cmd = self._build_command(job)
         except Exception as exc:
-            label = job.get("super_subject_label", "multi-SS")
             logger.error(
                 "Error construyendo comando para %s/%s: %s",
-                label, job["session"], exc,
+                _subjects_label(job), job["session"], exc,
             )
             return key, False
 
-        label = job.get("super_subject_label", f"multi-SS(S={job.get('n_super_subjects', '?')})")
+        label = _subjects_label(job)
         logger.info(
             "RUN | %s/%s | tasks=%s | L=%d | [%s-%s] s",
             label, job["session"],
@@ -919,129 +801,6 @@ class CDHSABatchRunner:
             return key, False
 
     # ------------------------------------------------------------------
-    # Post-processing: cross-super-subject comparison
-    # ------------------------------------------------------------------
-
-    def _run_comparison(self) -> None:
-        """Compile a cross-super-subject comparison of CD-HSA results.
-
-        For each completed job, reads ``cdhsa_summary.txt`` and
-        ``config.json`` from the output directory and produces a
-        consolidated comparison report.
-        """
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("  INICIANDO POST-PROCESAMIENTO: COMPARACION CRUZADA")
-        logger.info("=" * 70)
-
-        if not self.output_dir:
-            logger.warning(
-                "No se definio output_dir; no se puede ejecutar la comparacion."
-            )
-            return
-
-        # Group jobs by session
-        by_session: dict[str, list[dict]] = {}
-        for job in self.all_jobs:
-            by_session.setdefault(job["session"], []).append(job)
-
-        total_groups = len(by_session)
-        reports_generated = 0
-        reports_missing = 0
-
-        for session, jobs in sorted(by_session.items()):
-            logger.info("")
-            logger.info("  --- Session: %s ---", session)
-
-            comparison_lines: list[str] = []
-            comparison_lines.append("")
-            comparison_lines.append("=" * 70)
-            comparison_lines.append(
-                f"  CD-HSA CROSS-SUPER-SUBJECT COMPARISON -- {session}"
-            )
-            comparison_lines.append(
-                f"  Experiment: {self.params.get('experiment_label', 'N/A')}"
-            )
-            comparison_lines.append(
-                f"  Tasks: {', '.join(self.params['tasks'])}"
-            )
-            comparison_lines.append(
-                f"  Generated: {datetime.now().isoformat()}"
-            )
-            comparison_lines.append("=" * 70)
-
-            n_found = 0
-            for job in jobs:
-                ss_label = job["super_subject_label"]
-                out_dir = self._get_output_dir(job)
-                summary_path = out_dir / "cdhsa_summary.txt"
-                config_path = out_dir / "config.json"
-
-                comparison_lines.append("")
-                comparison_lines.append(f"  {'─' * 60}")
-                comparison_lines.append(f"  {ss_label}  |  {session}")
-                comparison_lines.append(f"  Output: {out_dir}")
-                comparison_lines.append(f"  {'─' * 60}")
-
-                if config_path.exists():
-                    try:
-                        with open(config_path, "r") as fh:
-                            cfg = json.load(fh)
-                        comparison_lines.append(
-                            f"  L={cfg.get('L', '?')}  "
-                            f"fixed_rank={cfg.get('fixed_rank', '?')}  "
-                            f"a6_n_null={cfg.get('a6_n_null', '?')}  "
-                            f"bc_n_perm={cfg.get('bc_n_perm', '?')}"
-                        )
-                    except Exception as exc:
-                        comparison_lines.append(
-                            f"  [WARN] Error leyendo config.json: {exc}"
-                        )
-
-                if summary_path.exists():
-                    try:
-                        with open(summary_path, "r") as fh:
-                            summary_text = fh.read().strip()
-                        # Indent summary content
-                        for line in summary_text.split("\n"):
-                            comparison_lines.append(f"    {line}")
-                        n_found += 1
-                    except Exception as exc:
-                        comparison_lines.append(
-                            f"  [ERROR] Leyendo cdhsa_summary.txt: {exc}"
-                        )
-                else:
-                    comparison_lines.append(
-                        "  [MISSING] cdhsa_summary.txt -- job no completado o error"
-                    )
-                    reports_missing += 1
-
-            comparison_lines.append("")
-            comparison_lines.append(f"  Super-subjects con resultados: {n_found} / {len(jobs)}")
-
-            # Save comparison report
-            if self.output_dir:
-                comp_dir = self.output_dir / "cdhsa" / session / "batch_comparison"
-                comp_dir.mkdir(parents=True, exist_ok=True)
-                tasks_tag = "_".join(self.params["tasks"])
-                comp_path = comp_dir / f"comparison_{tasks_tag}.txt"
-                try:
-                    with open(comp_path, "w", encoding="utf-8") as fh:
-                        fh.write("\n".join(comparison_lines))
-                    logger.info("  Guardado: %s", comp_path)
-                    reports_generated += 1
-                except OSError as exc:
-                    logger.error("  Error guardando comparacion: %s", exc)
-
-        logger.info("")
-        logger.info("=" * 70)
-        logger.info("  COMPARACION CRUZADA COMPLETADA")
-        logger.info("=" * 70)
-        logger.info("  Sesiones procesadas   : %d", total_groups)
-        logger.info("  Reportes generados    : %d", reports_generated)
-        logger.info("  Con datos faltantes   : %d sesiones", reports_missing)
-
-    # ------------------------------------------------------------------
     # Post-processing: extract mode indices JSON
     # ------------------------------------------------------------------
 
@@ -1089,7 +848,8 @@ class CDHSABatchRunner:
             tasks_tag = "_".join(job["tasks"])
             tw_tag = f"{job['t_start']}s-{job['t_end']}s"
             json_name = (
-                f"mode_map_{top_n}_modes_{job['session']}_{tasks_tag}_{tw_tag}.json"
+                f"mode_map_{top_n}_modes_singlesub_n{job['n_subjects']}"
+                f"_{job['session']}_{tasks_tag}_{tw_tag}.json"
             )
             json_out = self.params_dir / json_name
 
@@ -1101,10 +861,7 @@ class CDHSABatchRunner:
                 "-o", str(json_out),
             ]
 
-            label = job.get(
-                "super_subject_label",
-                f"multi-SS(S={job.get('n_super_subjects', '?')})",
-            )
+            label = _subjects_label(job)
             logger.info(
                 "  EXTRACT | %s/%s -> %s",
                 label, job["session"], json_name,
@@ -1214,7 +971,10 @@ class CDHSABatchRunner:
             logger.info("Todos los jobs ya estan completados.")
             self._run_mode_extraction()
             if self.run_comparison:
-                self._run_comparison()
+                logger.info(
+                    "run_comparison=true: NO APLICA en modo single-subject "
+                    "(un solo pool de sujetos por sesion; nada que comparar)."
+                )
             return 0
 
         logger.info("Total a ejecutar: %d / %d", total, len(self.all_jobs))
@@ -1239,7 +999,10 @@ class CDHSABatchRunner:
         self._run_mode_extraction()
 
         if self.run_comparison:
-            self._run_comparison()
+            logger.info(
+                "run_comparison=true: NO APLICA en modo single-subject "
+                "(un solo pool de sujetos por sesion; nada que comparar)."
+            )
 
         return 0 if failed == 0 else 1
 
@@ -1291,7 +1054,7 @@ class CDHSABatchRunner:
                 except Exception as exc:
                     logger.error(
                         "FUTURE EXCEPTION | %s/%s: %s",
-                        job["super_subject_label"], job["session"], exc,
+                        _subjects_label(job), job["session"], exc,
                     )
                     failed += 1
 
@@ -1311,7 +1074,7 @@ class CDHSABatchRunner:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Batch runner para el pipeline CD-HSA. "
+            "Batch runner para el pipeline CD-HSA single-subject. "
             "Lee la configuracion desde un JSON."
         ),
     )
@@ -1325,15 +1088,15 @@ def main() -> int:
     parser.add_argument(
         "--pipeline-script", type=str, default=None,
         help=(
-            "Ruta al script run_cdhsa.py. "
-            "Default: run_cdhsa.py en el mismo directorio que este script."
+            "Ruta al script run_cdhsa_single_subject.py. "
+            "Default: run_cdhsa_single_subject.py en src/pipelines."
         ),
     )
     args = parser.parse_args()
 
     json_path = Path(args.params_json) if args.params_json else DEFAULT_PARAMS_JSON
-    if os.environ.get("BATCH_CDHSA_PARAMS_JSON"):
-        json_path = Path(os.environ["BATCH_CDHSA_PARAMS_JSON"])
+    if os.environ.get("BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON"):
+        json_path = Path(os.environ["BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON"])
 
     pipeline_script = (
         Path(args.pipeline_script) if args.pipeline_script else None
@@ -1344,7 +1107,7 @@ def main() -> int:
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        runner = CDHSABatchRunner(params, pipeline_script=pipeline_script)
+        runner = SingleSubjectCDHSABatchRunner(params, pipeline_script=pipeline_script)
         return runner.run()
 
 
