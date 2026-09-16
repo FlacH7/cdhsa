@@ -1,0 +1,41 @@
+{
+  "experiment_label": "ludovico_01_cdhsa_single_subject",
+  "_comment_experiment": "CD-HSA para Ludovico_01: 1 sujeto (S=1), las 10 carpetas como condiciones (C=10). Se bypassea A6 (CV imposible con S=1), se saltean B/C (permutaciones imposibles con S=1), y el objetivo principal es el paso D (modos especificos por condicion).",
+
+  "dataset": {
+    "name": "ludovico_01",
+    "db_path_env_var": "DB_LUDOVICO_01_PATH",
+    "_comment_db_path": "Si no esta en config, usar --db-path en CLI"
+  },
+
+  "conditions": {
+    "_comment": "Lista de carpetas/CSVs a usar como condiciones. Null = auto-detectar todos los CSVs en db_path.",
+    "subjects": null,
+    "auto_detect": true
+  },
+
+  "preprocessing": {
+    "sfreq": 1000.0,
+    "apply_filter": false,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "_comment_filter": "Para simulaciones mecanicas no es EEG, se recomienda no filtrar. Poner apply_filter=true si se quiere bandpass.",
+    "t_start": null,
+    "t_stop": null
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "fixed_rank": 15,
+    "d_max_specific": 10,
+    "residual_rank_method": "local_gap",
+    "prevalence_quantile": 0.10,
+    "_comment_steps": "A6: bypassed (S=1). B/C: skipped (S=1). Tangent: skipped (S=1). D: ACTIVE (goal)."
+  },
+
+  "execution": {
+    "run_comparison": false,
+    "_comment_comparison": "No hay multi-SS para comparar, se desactiva."
+  }
+}

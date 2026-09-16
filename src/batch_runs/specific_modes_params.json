@@ -1,0 +1,54 @@
+{
+  "experiment_label": "5ss_2task_specific_modes",
+  "super_subjects": {
+    "selected": [1, 2, 3, 4, 5],
+    "subjects_per_super_subject": 12,
+    "subject_start_offset": 1,
+    "total_subjects": 60
+  },
+  "sessions": ["session1"],
+  "tasks": ["eyesclosed","music"],
+  "time_window": {
+    "t_start": 0.0,
+    "t_end": 300.0
+  },
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 15,
+    "rank_method": "fixed",
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "a6_max_common": 0,
+    "a6_n_folds": 5,
+    "a6_n_null": 200,
+    "a6_alpha": 0.05,
+    "a6_seed": 1234,
+    "bc_energy_metric": "log_absolute",
+    "bc_geometry_metric": "adjusted",
+    "bc_n_perm": 2000,
+    "bc_seed": 20260812,
+    "bc_alpha": 0.05,
+    "tangent_n_perm": 2000,
+    "tangent_seed": 9999,
+    "tangent_alpha": 0.05,
+    "d_max_specific": 10,
+    "d_residual_rank_method": "local_gap",
+    "d_residual_rank_threshold": 0.1,
+    "d_fixed_residual_rank": 5,
+    "prevalence_quantile": 0.10,
+    "seed": 42
+  },
+  "specificity_params": {
+    "k": 2
+  },
+  "execution": {
+    "max_workers": 1,
+    "delay": 1.0,
+    "run_comparison": true,
+    "save_hankel_matrices": false
+  }
+}

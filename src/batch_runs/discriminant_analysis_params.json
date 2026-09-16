@@ -1,0 +1,35 @@
+{
+  "experiment_label": "5ss_4task_discordance",
+  "_comment_experiment": "Extraer 2 direcciones de maxima discriminancia por tarea para cada uno de 5 super-sujetos y comparar la consistencia entre ellos.",
+
+  "super_subjects": {
+    "selected": [1, 2, 3, 4, 5],
+    "subjects_per_super_subject": 12,
+    "subject_start_offset": 1,
+    "total_subjects": 60
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "eyesopen", "music", "memory", "mathematic"],
+
+  "time_window": {
+    "t_start": 0.0,
+    "t_end": 300.0,
+    "_comment": "Ventana temporal POR SUJETO. Con 12 sujetos * 60s * 500Hz = 360k muestras. Memoria por tarea: ~1.5 GB. Total por SS: ~6 GB."
+  },
+
+  "discriminant_params": {
+    "k": 2,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "_comment_k": "Cantidad de direcciones de discriminancia por tarea. Estas son las direcciones que mas cambian entre la tarea y el promedio de todas las tareas."
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 1.0,
+    "run_comparison": true
+  }
+}
