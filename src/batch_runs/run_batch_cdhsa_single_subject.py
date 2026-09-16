@@ -58,7 +58,7 @@ From the repository root (with ``.env`` configured)::
     python src/batch_runs/run_batch_cdhsa_single_subject.py --params-json /path/to/params.json
 
     # Override via environment variable
-    BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON=/path/to/params.json \
+    BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON=/path/to/params.json \\
         python src/batch_runs/run_batch_cdhsa_single_subject.py
 """
 
