@@ -58,7 +58,7 @@ From the repository root (with ``.env`` configured)::
     python src/batch_runs/run_batch_cdhsa_single_subject.py --params-json /path/to/params.json
 
     # Override via environment variable
-    BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON=/path/to/params.json \\
+    BATCH_CDHSA_SINGLE_SUBJECT_PARAMS_JSON=/path/to/params.json \
         python src/batch_runs/run_batch_cdhsa_single_subject.py
 """
 
@@ -499,11 +499,11 @@ class SingleSubjectCDHSABatchRunner:
         # uses nargs='+')
         cmd.extend(["--tasks"] + job["tasks"])
 
-        # Time window
-        cmd.extend([
-            "--t-start", job["t_start"],
-            "--t-end", job["t_end"],
-        ])
+        # Time window (only when defined in the JSON)
+        if job["t_start"] != "None":
+            cmd.extend(["--t-start", job["t_start"]])
+        if job["t_end"] != "None":
+            cmd.extend(["--t-end", job["t_end"]])
 
         # CD-HSA parameters
         cmd.extend([
@@ -554,8 +554,8 @@ class SingleSubjectCDHSABatchRunner:
         tw = {"t_start": job["t_start"], "t_end": job["t_end"]}
         tasks = job["tasks"]
 
-        t_start_tag = tw["t_start"] if tw["t_start"] != "None" else "any"
-        t_end_tag = tw["t_end"] if tw["t_end"] != "None" else "any"
+        t_start_tag = (f"{tw['t_start']}s" if tw["t_start"] != "None" else "any")
+        t_end_tag = (f"{tw['t_end']}s" if tw["t_end"] != "None" else "any")
 
         L = cdhsa["L"]
         fr = cdhsa.get("fixed_rank", 10)
@@ -563,7 +563,7 @@ class SingleSubjectCDHSABatchRunner:
         bcn = cdhsa.get("bc_n_perm", 5000)
         l_freq = cdhsa.get("l_freq", 1.0)
         h_freq = cdhsa.get("h_freq", 40.0)
-        depth = cdhsa.get("hankel_depth", "auto")
+        depth = cdhsa.get("hankel_depth") or "auto"
 
         subj_label = f"nSub{job['n_subjects']}"
 
@@ -573,7 +573,7 @@ class SingleSubjectCDHSABatchRunner:
             f"_fr{fr}_a6n{a6n}_bcn{bcn}"
             f"/{l_freq}-{h_freq}Hz"
             f"_depth{depth}"
-            f"/from{t_start_tag}s_to{t_end_tag}s"
+            f"/from{t_start_tag}_to{t_end_tag}"
             f"_{'_'.join(tasks)}"
         )
         return out_dir
