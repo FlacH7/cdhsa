@@ -1,6 +1,11 @@
 """
-cdhsa/b_energy.py — Steps B/C of CD-HSA: Energy and geometry condition tests
+cdhsa/b_energy.py — Steps B/C of CD-HSA (memory-optimized): Energy and geometry condition tests
 ================================================================================
+
+Memory-Optimized version of b_energy.py.  Instead of materializing the
+block-Hankel matrix H inside ``compute_common_mode_metrics``, we compute
+‖H‖_F² and H^T @ W_k block-by-block directly from X, so the large
+(p·L × T−L+1) matrix is never allocated.
 
 For each fixed common Hankel mode/block (from A6.W0):
 
@@ -21,7 +26,7 @@ A6.W0 is held FIXED. Since W0 was estimated from the pooled subject×condition
 projectors WITHOUT using condition labels, relabeling conditions within a
 subject does NOT change the pooled W0. This justifies the permutation test.
 
-Dependencies: numpy, cdhsa.a_common_subspace, cdhsa.permutation_tests
+Dependencies: numpy, cdhsa.permutation_tests
 """
 
 from __future__ import annotations
@@ -29,8 +34,70 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from src.cdhsa.a_common_subspace import build_block_hankel
-from src.cdhsa.permutation_tests import within_subject_permutation_rm
+try:
+    from src.cdhsa.permutation_tests import within_subject_permutation_rm
+except ImportError:
+    from permutation_tests import within_subject_permutation_rm
+
+
+# ============================================================================
+# Block-Hankel helpers — compute key quantities WITHOUT materializing H
+# ============================================================================
+
+def _block_hankel_fro_sq(X: NDArray[np.floating], L: int) -> float:
+    """Compute ||build_block_hankel(X, L)||_F^2 without materializing H.
+
+    Uses: ||H||_F^2 = sum_ell ||X[:, L-1-ell : T-ell]||_F^2
+    Each block is a VIEW into X.  Uses np.dot for memory efficiency.
+
+    Parameters
+    ----------
+    X : array, shape (p, T)
+    L : int
+
+    Returns
+    -------
+    fro_sq : float
+    """
+    X = np.asarray(X, dtype=np.float64)
+    p, T = X.shape
+    K = T - L + 1
+    fro_sq = 0.0
+    for ell in range(L):
+        block = X[:, L-1-ell : T-ell]
+        fro_sq += np.dot(block.ravel(), block.ravel())
+    return fro_sq
+
+
+def _block_hankel_T_dot_W(
+    X: NDArray[np.floating],
+    L: int,
+    Wk: NDArray[np.floating],
+) -> NDArray[np.floating]:
+    """Compute H^T @ Wk where H = build_block_hankel(X, L), WITHOUT materializing H.
+
+    H^T @ Wk = sum_ell block_ell^T @ Wk[ell*p:(ell+1)*p, :]
+
+    Parameters
+    ----------
+    X : array, shape (p, T)
+    L : int
+    Wk : array, shape (p*L, dim_k)
+
+    Returns
+    -------
+    proj : array, shape (K, dim_k)  where K = T - L + 1
+    """
+    X = np.asarray(X, dtype=np.float64)
+    p, T = X.shape
+    K = T - L + 1
+    dim_k = Wk.shape[1]
+
+    proj = np.zeros((K, dim_k), dtype=np.float64)
+    for ell in range(L):
+        block = X[:, L-1-ell : T-ell]  # (p, K) — VIEW
+        proj += block.T @ Wk[ell*p:(ell+1)*p, :]
+    return proj
 
 
 # ============================================================================
@@ -100,27 +167,29 @@ def compute_common_mode_metrics(
     for s in range(S):
         for c in range(C):
             Xi = np.asarray(X[s][c], dtype=np.float64)
-            H = build_block_hankel(Xi, L)  # (d, K_hankel)
-            Ht = H.T  # (K_hankel, d) — precompute transpose
-            total_energy = np.linalg.norm(H, "fro") ** 2
+            p_sc = Xi.shape[0]
+            T_sc = Xi.shape[1]
+
+            # ||H||_F^2 without materializing H
+            total_energy = _block_hankel_fro_sq(Xi, L)
 
             Ui = R["U"][s][c]  # (d, r_sc)
             r_sc = R["rank"][s, c]
 
             for k, idx in enumerate(blocks):
-                idx = np.atleast_1d(np.asarray(idx, dtype=int)) - 1  # 0-based
-                Wk = A6["W0"][:, idx]  # (d, dim_k)
+                idx_0 = np.atleast_1d(np.asarray(idx, dtype=int)) - 1  # 0-based
+                Wk = A6["W0"][:, idx_0]  # (d, dim_k)
 
-                # Energy: ||H^T W_k||_F²
-                proj = Ht @ Wk  # (K_hankel, dim_k)
-                energy_abs[s, c, k] = np.linalg.norm(proj, "fro") ** 2
+                # Energy: ||H^T W_k||_F²  (computed block-wise, no H)
+                proj = _block_hankel_T_dot_W(Xi, L, Wk)
+                energy_abs[s, c, k] = np.dot(proj.ravel(), proj.ravel())
                 energy_rel[s, c, k] = energy_abs[s, c, k] / max(
                     total_energy, 1e-300
                 )
 
-                # Alignment: ||U_sc^T W_k||_F²
+                # Alignment: ||U_sc^T W_k||_F²  (uses small U, no change)
                 G = Ui.T @ Wk  # (r_sc, dim_k)
-                raw = np.linalg.norm(G, "fro") ** 2
+                raw = np.dot(G.ravel(), G.ravel())
                 align_raw[s, c, k] = raw
                 align_adj[s, c, k] = raw / max(r_sc, 1)
 

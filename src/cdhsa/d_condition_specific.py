@@ -1,19 +1,20 @@
 """
-cdhsa/d_condition_specific.py - Step D: Condition-specific residual modes
-========================================================================
+cdhsa/d_condition_specific.py - Step D: Condition-specific residual modes (memory-optimized)
+=================================================================================================
 
-After extracting the common subspace W0 (steps A1-A6), Step D identifies
-modes that are reliably present within a condition but NOT captured by
-the common subspace.
+Memory-Optimized version of d_condition_specific.py.
 
-Algorithm (JIVE-inspired):
-  1. For each (s,c), compute the residual basis after removing W0:
-     U_res_sc = orthogonalize((I - W0 W0^T) @ U_sc)
-  2. Pool residual bases within each condition across subjects:
-     B_c = [U_res_1c, ..., U_res_Sc] / sqrt(S)
-  3. SVD of B_c to obtain condition-specific directions W_c
-  4. Quantify per-subject alignment with condition-specific modes
-  5. Test for condition-specific structure via prevalence contrast
+This step operates entirely on the already-computed left singular vectors
+U_sc (from A1-A5) and the common subspace W0 (from A6).  Both are small
+matrices of shape (d, r) where d = p*L and r is typically 10-15.  The
+block-Hankel matrix H is NEVER needed or materialized in this step.
+
+Changes vs original (d_condition_specific.py):
+  1. Removed unused import of ``build_block_hankel`` and ``truncated_left_svd``
+     from ``a_common_subspace`` — these were dead imports that could mislead
+     developers into thinking H was materialized here.
+  2. Updated module docstring to clarify memory profile.
+  3. Algorithm is IDENTICAL — no numerical changes.
 
 Dependencies: numpy
 """
@@ -81,8 +82,14 @@ def cdhsa_D_condition_specific_modes(
     ----------
     X : list of list of arrays
         X[s][c] shape (p, T) - original EEG data.
+        NOTE (v2): X is accepted for API compatibility but is NOT used
+        internally.  This step operates solely on R["U"] and A6["W0"],
+        which are small matrices already computed by A1-A5 and A6.
+        Keeping X in the signature ensures drop-in compatibility with
+        the original ``cdhsa_D_condition_specific_modes`` and with
+        the ``run_cdhsa`` orchestrator.
     L : int
-        Hankel embedding depth.
+        Hankel embedding depth (accepted for API compatibility, not used).
     R : dict
         Output of cdhsa_A1_A5. Must contain 'U', 'S', 'C', 'p', 'rank'.
     A6 : dict
@@ -121,6 +128,16 @@ def cdhsa_D_condition_specific_modes(
             Mean(own alignment) - Mean(cross alignment) per condition.
         S, C, p, d, r0
 
+    MEMORY PROFILE (v2)
+    -------------------
+    This step operates exclusively on:
+      - R["U"][s][c] : shape (d, r_sc) where d = p*L, r_sc ~ 10-15
+      - A6["W0"]     : shape (d, r0)  where r0 ~ 10-15
+      - Concatenated residual bases B_c : shape (d, sum_r_res) ~ (d, 50)
+    
+    No block-Hankel matrix is ever materialized. Peak memory is
+    O(S * C * d * r_max) which is negligible compared to A1-A5 or B/C.
+
     DESIGN NOTES
     ------------
     This Step is inspired by JIVE's individual structure estimation.
@@ -135,8 +152,6 @@ def cdhsa_D_condition_specific_modes(
     - This is descriptive, not inferential. For formal testing,
       use the B/C permutation tests on the specific-mode alignment.
     """
-    from src.cdhsa.a_common_subspace import build_block_hankel, truncated_left_svd
-
     if opts is None:
         opts = {}
     max_specific = opts.get("max_specific", 10)

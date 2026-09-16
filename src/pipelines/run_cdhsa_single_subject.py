@@ -4,7 +4,7 @@ src.pipelines.run_cdhsa_single_subject - CD-HSA over individual subjects
 
 Dedicated CLI pipeline that builds Hankel matrices from **individual
 subjects** (S = n_subjects, C = tasks) instead of super-subjects, and
-then runs the memory-optimized CD-HSA core (``run_cdhsa_v2``).
+then runs the memory-optimized CD-HSA core (``run_cdhsa``).
 
 A separate CLI is provided (rather than a third mode inside
 ``run_cdhsa.py``) because the original CLI already has a mutually
@@ -47,9 +47,8 @@ Para cada par (sujeto, condicion)::::
     4. Matriz de Hankel        -> _build_multivariate_hankel()
        (H: (n_channels * depth) x (n_times - depth + 1))
 
-Despues: characterize_hankel_matrices() -> run_cdhsa_v2() -> save_results()
-(ambas reutilizadas sin modificar de src.pipelines.run_cdhsa /
-src.pipelines.run_cdhsa_v2).
+Despues: characterize_hankel_matrices() -> run_cdhsa() -> save_results()
+(ambas reutilizadas sin modificar de src.pipelines.run_cdhsa).
 """
 
 from __future__ import annotations
@@ -68,7 +67,7 @@ from src.pipelines.run_cdhsa import (
     characterize_hankel_matrices,
     save_results,
 )
-from src.pipelines.run_cdhsa_v2 import run_cdhsa_v2
+from src.pipelines.run_cdhsa import run_cdhsa
 
 
 # =====================================================================
@@ -371,7 +370,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         description=(
             "CD-HSA sobre sujetos individuales: construye matrices de "
             "Hankel por sujeto (S = n_subjects, sin concatenar) del "
-            "dataset Gedai y ejecuta el analisis CD-HSA (v2)."
+            "dataset Gedai y ejecuta el analisis CD-HSA (memory-optimized)."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -553,7 +552,7 @@ def main(argv: list[str] | None = None) -> int:
         print("\n[ERROR] No se construyeron matrices validas.")
         return 1
 
-    # 3. Configurar y ejecutar CD-HSA (v2: memory-optimized)
+    # 3. Configurar y ejecutar CD-HSA (memory-optimized)
     cfg = CDHSAConfig(
         fixed_rank=args.fixed_rank,
         rank_method=args.rank_method,
@@ -568,7 +567,7 @@ def main(argv: list[str] | None = None) -> int:
 
     S = len(X)
     print("\n" + "=" * 70)
-    print("  EJECUTANDO CD-HSA (v2: memory-optimized)")
+    print("  EJECUTANDO CD-HSA (memory-optimized)")
     print("=" * 70)
     print(f"  Modo                  : single-subject")
     print(f"  Sujetos (S)           : {S}")
@@ -582,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
     print("")
     sys.stdout.flush()
 
-    result = run_cdhsa_v2(X, args.L, cfg)
+    result = run_cdhsa(X, args.L, cfg)
 
     # 4. Resultados
     print("")

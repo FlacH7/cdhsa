@@ -1,9 +1,14 @@
 """
-cdhsa/a_common_subspace.py — Steps A1-A5 of CD-HSA
-=====================================================
+cdhsa/a_common_subspace.py — Steps A1-A5 of CD-HSA (memory-optimized: LinearOperator, H never materialized)
+==========================================================================
 
 Estima el subespacio Hankel común poblacional a partir de grabaciones
 EEG multicanal de múltiples sujetos y condiciones.
+
+**Memory Optimization**: This version uses `scipy.sparse.linalg.LinearOperator`
+instead of materializing the block-Hankel matrix H of shape (p*L, K), which can
+exceed 12 GB in realistic EEG datasets. The LinearOperator computes matrix-vector
+products on-the-fly, so `svds` never needs the full matrix in memory.
 
 NOTA CRÍTICA DE DISEÑO
 ------------------------
@@ -34,15 +39,22 @@ con las siguientes mejoras y correcciones identificadas:
 5. **Tipado y documentación**: Docstrings completos con tipos, shape
    annotations, y referencias a las ecuaciones del marco teórico.
 
+6. **Optimización de memoria (v2)**: En lugar de materializar la matriz
+   block-Hankel H de shape (p*L, K) — que puede exceder 12 GB — se usa
+   `scipy.sparse.linalg.LinearOperator` para que `svds` nunca necesite
+   la matriz completa. Se añaden ``make_block_hankel_linop``,
+   ``_make_scaled_linop``, y ``compute_block_hankel_fro``.
+
 Dependencias: numpy, scipy.sparse.linalg (solo para SVD truncada grande).
 """
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Literal, Union
 
 import numpy as np
 from numpy.typing import NDArray
+from scipy.sparse.linalg import LinearOperator as ScipyLinearOperator
 from scipy.sparse.linalg import svds
 
 
@@ -90,6 +102,10 @@ def build_block_hankel(X: NDArray[np.floating], L: int) -> NDArray[np.floating]:
     los subespacios U serán los mismos (las columnas solo se reordenan
     dentro del bloque), pero los patrones espaciales-temporales reshaped
     W_j(e,τ) tendrán el eje τ invertido. Verificar antes de interpretar.
+
+    NOTA (v2): Esta función se conserva para compatibilidad hacia atrás
+    y pruebas unitarias. El camino optimizado en memoria usa
+    ``make_block_hankel_linop`` en su lugar.
     """
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
@@ -109,11 +125,167 @@ def build_block_hankel(X: NDArray[np.floating], L: int) -> NDArray[np.floating]:
 
 
 # ============================================================================
+# 0b. Memory-efficient block-Hankel helpers (v2)
+# ============================================================================
+
+def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOperator:
+    """
+    Create a LinearOperator that computes build_block_hankel(X, L) @ v
+    and build_block_hankel(X, L).T @ w WITHOUT materializing the matrix.
+
+    The block-Hankel H of shape (p*L, K) where K = T - L + 1 has::
+
+        H[ell*p:(ell+1)*p, :] = X[:, L-1-ell : T-ell]  for ell = 0..L-1
+
+    So H @ v is computed by stacking L matrix-vector products of (p, K) slices.
+    And H.T @ w is computed by summing L transposed products.
+
+    Parameters
+    ----------
+    X : array, shape (p, T)
+        Datos EEG canales × tiempo.
+    L : int
+        Número de retardos (embedding depth).
+
+    Returns
+    -------
+    linop : ScipyLinearOperator, shape (p*L, K)
+        LinearOperator compatible con ``scipy.sparse.linalg.svds``.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"X debe ser 2-D (p × T), got shape {X.shape}")
+    p, T = X.shape
+    if T < L:
+        raise ValueError(
+            f"T ({T}) debe ser >= L ({L}) para construir Hankel"
+        )
+    K = T - L + 1
+    d = p * L
+
+    def matvec(v):
+        v = np.asarray(v).ravel()
+        out = np.zeros(d, dtype=np.float64)
+        for ell in range(L):
+            block = X[:, L - 1 - ell : T - ell]
+            out[ell * p : (ell + 1) * p] = block @ v
+        return out
+
+    def rmatvec(w):
+        w = np.asarray(w).ravel()
+        out = np.zeros(K, dtype=np.float64)
+        for ell in range(L):
+            block = X[:, L - 1 - ell : T - ell]
+            out += block.T @ w[ell * p : (ell + 1) * p]
+        return out
+
+    def _matmat(V):
+        """H @ V for V of shape (K, nvec) -> (d, nvec)."""
+        V = np.asarray(V)
+        if V.ndim == 1:
+            return matvec(V)
+        nvec = V.shape[1]
+        out = np.zeros((d, nvec), dtype=np.float64)
+        for ell in range(L):
+            block = X[:, L - 1 - ell : T - ell]  # (p, K)
+            out[ell * p : (ell + 1) * p, :] = block @ V  # (p, nvec)
+        return out
+
+    def _rmatmat(W):
+        """H.T @ W for W of shape (d, nvec) -> (K, nvec)."""
+        W = np.asarray(W)
+        if W.ndim == 1:
+            return rmatvec(W)
+        nvec = W.shape[1]
+        out = np.zeros((K, nvec), dtype=np.float64)
+        for ell in range(L):
+            block = X[:, L - 1 - ell : T - ell]  # (p, K)
+            out += block.T @ W[ell * p : (ell + 1) * p, :]  # (K, nvec)
+        return out
+
+    linop = ScipyLinearOperator((d, K), matvec=matvec, rmatvec=rmatvec, dtype=np.float64)
+    linop._matmat = _matmat
+    linop._rmatmat = _rmatmat
+    return linop
+
+
+def _make_scaled_linop(linop: ScipyLinearOperator, scale: float) -> ScipyLinearOperator:
+    """Return a new LinearOperator that computes linop @ v / scale.
+
+    This is the memory-efficient equivalent of H / hnorm where H is the
+    block-Hankel matrix and hnorm is its Frobenius norm.
+
+    Parameters
+    ----------
+    linop : ScipyLinearOperator
+        LinearOperator representando la matriz a escalar.
+    scale : float
+        Escalar divisor (debe ser > 0).
+
+    Returns
+    -------
+    scaled : ScipyLinearOperator
+        LinearOperator que computa linop @ v / scale.
+    """
+    def matvec(v):
+        return linop.matvec(v) / scale
+
+    def rmatvec(w):
+        return linop.rmatvec(w) / scale
+
+    def _matmat(V):
+        return linop.matmat(V) / scale
+
+    def _rmatmat(W):
+        return linop.rmatmat(W) / scale
+
+    scaled = ScipyLinearOperator(linop.shape, matvec=matvec, rmatvec=rmatvec, dtype=linop.dtype)
+    scaled._matmat = _matmat
+    scaled._rmatmat = _rmatmat
+    return scaled
+
+
+def compute_block_hankel_fro(X: NDArray[np.floating], L: int) -> float:
+    """
+    Compute ||build_block_hankel(X, L)||_F without materializing the matrix.
+
+    Uses: ||H||_F^2 = sum_ell ||X[:, L-1-ell : T-ell]||_F^2
+    Each block is a VIEW into X, so peak memory = O(p * K) for the dot product.
+    Uses np.dot(block.ravel(), block.ravel()) to avoid creating block**2 temporary.
+
+    Parameters
+    ----------
+    X : array, shape (p, T)
+        Datos EEG canales × tiempo.
+    L : int
+        Número de retardos (embedding depth).
+
+    Returns
+    -------
+    hnorm : float
+        Norma Frobenius de la matriz block-Hankel.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if X.ndim != 2:
+        raise ValueError(f"X debe ser 2-D (p × T), got shape {X.shape}")
+    p, T = X.shape
+    if T < L:
+        raise ValueError(
+            f"T ({T}) debe ser >= L ({L}) para construir Hankel"
+        )
+    fro_sq = 0.0
+    for ell in range(L):
+        block = X[:, L - 1 - ell : T - ell]
+        fro_sq += np.dot(block.ravel(), block.ravel())
+    return np.sqrt(fro_sq)
+
+
+# ============================================================================
 # 1. Truncated SVD helpers
 # ============================================================================
 
 def truncated_left_svd(
-    H: NDArray[np.floating],
+    H: Union[NDArray[np.floating], ScipyLinearOperator],
     r: int,
 ) -> NDArray[np.floating]:
     """
@@ -122,9 +294,13 @@ def truncated_left_svd(
     Usa ``scipy.sparse.linalg.svds`` cuando r < min(m,n)-1 para eficiencia,
     con fallback a SVD densa.
 
+    Cuando H es un ``ScipyLinearOperator``, solo se puede usar ``svds``
+    (no hay acceso a la matriz densa para el fallback).
+
     Parameters
     ----------
-    H : array, shape (m, n)
+    H : array, shape (m, n)  o  ScipyLinearOperator, shape (m, n)
+        Matriz o LinearOperator.
     r : int
         Número de componentes a retener.
 
@@ -141,13 +317,29 @@ def truncated_left_svd(
 
     Además, ``svds`` puede fallar con ARNOLDI para matrices con valores
     singulares degenerados (común en oscilaciones Hankel). El fallback
-    a SVD densa cubre ese caso.
+    a SVD densa cubre ese caso (solo disponible si H es densa).
+
+    NOTA (v2): Cuando H es un ScipyLinearOperator, no se puede hacer
+    fallback a SVD densa. Si ``svds`` falla, se propaga la excepción.
     """
     m, n = H.shape
     r = min(r, m, n)
     if r < 1:
         raise ValueError(f"r debe ser >= 1, got {r}")
 
+    if isinstance(H, ScipyLinearOperator):
+        # LinearOperator: can only use svds, no dense fallback
+        if r >= min(m, n):
+            raise ValueError(
+                f"r={r} too large for LinearOperator with shape {H.shape}. "
+                f"Need r < min({m}, {n}) = {min(m, n)}"
+            )
+        U, s_vals, _ = svds(H, k=r)
+        # scipy svds → orden ascendente, corregir
+        idx = np.argsort(s_vals)[::-1]
+        return U[:, idx]
+
+    # Original dense path (unchanged)
     # Usar svds solo cuando es seguro y ventajoso
     if r < min(m, n) - 1:
         try:
@@ -164,23 +356,48 @@ def truncated_left_svd(
 
 
 def truncated_left_svd_with_values(
-    H: NDArray[np.floating],
+    H: Union[NDArray[np.floating], ScipyLinearOperator],
     r: int,
 ) -> tuple[NDArray[np.floating], NDArray[np.floating]]:
     """
     Primeros ``r`` vectores singulares izquierdos y sus valores.
+
+    Cuando H es un ``ScipyLinearOperator``, solo se puede usar ``svds``
+    (no hay acceso a la matriz densa para el fallback).
+
+    Parameters
+    ----------
+    H : array, shape (m, n)  o  ScipyLinearOperator, shape (m, n)
+        Matriz o LinearOperator.
+    r : int
+        Número de componentes a retener.
 
     Returns
     -------
     U : array, shape (m, r)
     s : array, shape (r,)
         Valores singulares en orden descendente.
+
+    NOTA (v2): Cuando H es un ScipyLinearOperator, no se puede hacer
+    fallback a SVD densa.
     """
     m, n = H.shape
     r = min(r, m, n)
     if r < 1:
         raise ValueError(f"r debe ser >= 1, got {r}")
 
+    if isinstance(H, ScipyLinearOperator):
+        # LinearOperator: can only use svds, no dense fallback
+        if r >= min(m, n):
+            raise ValueError(
+                f"r={r} too large for LinearOperator with shape {H.shape}. "
+                f"Need r < min({m}, {n}) = {min(m, n)}"
+            )
+        U, s_vals, _ = svds(H, k=r)
+        idx = np.argsort(s_vals)[::-1]
+        return U[:, idx], s_vals[idx]
+
+    # Original dense path (unchanged)
     if r < min(m, n) - 1:
         try:
             U, s_vals, _ = svds(H, k=r)
@@ -253,9 +470,12 @@ def select_rank_reproducibility(
     3. **Bloques demasiado cortos**: Si T/n_blocks < L + 2, los bloques
        no tienen suficientes columnas Hankel. El MATLAB lanza error; aquí
        damos un warning y reducimos n_blocks automáticamente.
+
+    NOTA (v2): Usa ``compute_block_hankel_fro`` y ``make_block_hankel_linop``
+    para evitar materializar la matriz block-Hankel completa.
     """
     X = np.asarray(X, dtype=np.float64)
-    _, T = X.shape
+    p, T = X.shape
 
     # Validar que los bloques sean factibles
     min_block_len = L + 2
@@ -269,6 +489,7 @@ def select_rank_reproducibility(
     effective_blocks = min(n_blocks, max_feasible_blocks)
     if effective_blocks < n_blocks:
         import warnings
+
         warnings.warn(
             f"Reduciendo n_blocks de {n_blocks} a {effective_blocks} "
             f"(T={T}, L={L}, se necesitan >={min_block_len} muestras por bloque)",
@@ -288,13 +509,15 @@ def select_rank_reproducibility(
                 f"Bloque {b} tiene solo {Xb.shape[1]} columnas, "
                 f"necesitas > {L} para Hankel con L={L}."
             )
-        Hb = build_block_hankel(Xb, L)
-        hnorm = np.linalg.norm(Hb, "fro")
+        # v2: compute Frobenius norm without materializing H
+        hnorm = compute_block_hankel_fro(Xb, L)
         if hnorm < np.finfo(np.float64).eps:
             raise ValueError(f"Bloque {b} tiene Hankel casi cero.")
-        Hb = Hb / hnorm
-        rb = min(rmax, Hb.shape[0], Hb.shape[1])
-        bases.append(truncated_left_svd(Hb, rb))
+        # v2: use LinearOperator instead of dense matrix
+        linop_b = make_block_hankel_linop(Xb, L)
+        linop_b_norm = _make_scaled_linop(linop_b, hnorm)
+        rb = min(rmax, linop_b_norm.shape[0], linop_b_norm.shape[1])
+        bases.append(truncated_left_svd(linop_b_norm, rb))
         r_allowed = min(r_allowed, rb)
 
     # Calcular reproducibilidad
@@ -434,6 +657,10 @@ def cdhsa_A1_A5(
     - Normalización por ||H||_F: conservada por compatibilidad con B/C,
       aunque no afecta a U_sc.
     - No construimos los proyectores pL×pL explícitamente (igual que MATLAB).
+
+    NOTA (v2): Esta versión usa ``scipy.sparse.linalg.LinearOperator``
+    en lugar de materializar la matriz block-Hankel H de shape (p*L, K).
+    Esto reduce el pico de memoria de ~12 GB a ~O(p*K) por bloque temporal.
     """
     # ---- Dimensiones del problema ----
     S = len(X)
@@ -465,25 +692,28 @@ def cdhsa_A1_A5(
     for s in range(S):
         for c in range(C):
             Xi = np.asarray(X[s][c], dtype=np.float64)
-            H = build_block_hankel(Xi, L)
-            hnorm = np.linalg.norm(H, "fro")
+            # v2: compute Frobenius norm without materializing H
+            hnorm = compute_block_hankel_fro(Xi, L)
             if hnorm <= np.finfo(np.float64).eps:
                 raise ValueError(
                     f"Hankel casi cero en sujeto {s}, condición {c}"
                 )
             hankel_norms[s, c] = hnorm
 
-            # A1: normalización geométrica (no cambia U_sc, pero la
+            # A1: normalización geométrica via LinearOperator (no cambia U_sc, pero la
             # guardamos para B/C que necesita la escala original)
-            Hgeom = H / hnorm
+            linop = make_block_hankel_linop(Xi, L)
+            linop_norm = _make_scaled_linop(linop, hnorm)
 
             # A2: rank local
             if rank_method == "fixed":
-                r = min(fixed_rank, Hgeom.shape[0], Hgeom.shape[1])
+                K_hankel = Xi.shape[1] - L + 1
+                r = min(fixed_rank, p * L, K_hankel)
                 repro = None
             elif rank_method == "reproducibility":
                 r, repro = select_rank_reproducibility(
-                    Xi, L,
+                    Xi,
+                    L,
                     rmax=rmax,
                     n_blocks=n_blocks,
                     threshold=repro_threshold,
@@ -494,7 +724,7 @@ def cdhsa_A1_A5(
                     f"rank_method debe ser 'fixed' o 'reproducibility', got '{rank_method}'"
                 )
 
-            Ui = truncated_left_svd(Hgeom, r)
+            Ui = truncated_left_svd(linop_norm, r)
             U_all[s][c] = Ui
             ranks[s, c] = r
             repro_curves[s][c] = repro
