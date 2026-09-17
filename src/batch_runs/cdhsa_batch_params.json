@@ -15,7 +15,7 @@
 
   "time_window": {
     "t_start": 100.0,
-    "t_end": 101.0,
+    "t_end": 200.0,
     "_comment": "Ventana temporal POR SUJETO. Con t_end=200 y 12 subjects, cada SS tiene 2400s.."
   },
 
