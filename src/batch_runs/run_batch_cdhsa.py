@@ -300,7 +300,7 @@ class CDHSABatchRunner:
 
     CSV_FIELDS = [
         "timestamp", "mode", "super_subject", "session", "tasks",
-        "L", "fixed_rank", "hankel_depth",
+        "L", "fixed_rank", "rank_method", "hankel_depth",
         "t_start", "t_end", "success", "returncode",
         "elapsed_s", "command",
     ]
@@ -440,8 +440,27 @@ class CDHSABatchRunner:
                     cdhsa.get("l_freq", 1.0), cdhsa.get("h_freq", 40.0))
         logger.info("    fixed_rank     : %d", cdhsa.get("fixed_rank", 10))
         logger.info("    rank_method    : %s", cdhsa.get("rank_method", "fixed"))
+        if cdhsa.get("rank_method", "fixed") == "variance":
+            logger.info("    var_explained  : %.2f (cap=%d, piso=%d)",
+                        cdhsa.get("var_explained", 0.99),
+                        cdhsa.get("var_max_rank", 50),
+                        cdhsa.get("var_min_rank", 1))
+        logger.info("    a6_max_common  : %s",
+                    cdhsa.get("a6_max_common", 0))
+        logger.info("    a6_null_type   : %s",
+                    cdhsa.get("a6_null_type", "haar"))
         logger.info("    a6_n_null      : %d", cdhsa.get("a6_n_null", 100))
         logger.info("    bc_n_perm      : %d", cdhsa.get("bc_n_perm", 5000))
+        logger.info("    tangent_blocks : %s",
+                    cdhsa.get("tangent_blocks_mode", "omnibus"))
+        logger.info("    d_max_specific : %s (adaptive=%s)",
+                    cdhsa.get("d_max_specific", 10),
+                    cdhsa.get("d_rank_adaptive", False))
+        logger.info("    d_loso         : %s (n_perm=%s)",
+                    cdhsa.get("d_loso", False),
+                    cdhsa.get("d_loso_n_perm", 1000))
+        logger.info("    replica_consist: %s",
+                    cdhsa.get("run_replica_consistency", False))
         logger.info("    skip_bc        : %s", cdhsa.get("skip_bc", False))
         logger.info("    skip_tangent   : %s", cdhsa.get("skip_tangent", False))
         logger.info("    skip_d         : %s", cdhsa.get("skip_d", False))
@@ -489,15 +508,28 @@ class CDHSABatchRunner:
 
     @staticmethod
     def _checkpoint_key(job: dict) -> str:
-        """Build a unique checkpoint key from a job dict."""
+        """Build a unique checkpoint key from a job dict.
+
+        Incluye L, la etiqueta de rango (frXX / varXXcYY), el modo de
+        bloques tangentes y el estado del enmascaramiento de fronteras
+        para que un cambio de configuracion (p.ej. fixed -> variance,
+        omnibus -> cumulative, fronteras on/off) re-ejecute el job en
+        vez de saltarselo por un checkpoint viejo.
+        """
         tasks_str = "+".join(job["tasks"])
+        cdhsa = job["cdhsa_params"]
+        rtag = CDHSABatchRunner._rank_tag(cdhsa)
+        tb = cdhsa.get("tangent_blocks_mode", "cumulative")[:4]
+        bm = "bm0" if cdhsa.get("no_boundary_mask", False) else "bm1"
         if job.get("mode") == "multi_ss":
             return (f"multiss_{job['n_super_subjects']}|{job['session']}|"
-                    f"{tasks_str}|{job['t_start']}|{job['t_end']}")
+                    f"{tasks_str}|{job['t_start']}|{job['t_end']}|"
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{tb}|{bm}")
         else:
             sid = job["super_subject_id"]
             return (f"ss{sid:02d}|{job['session']}|{tasks_str}|"
-                    f"{job['t_start']}|{job['t_end']}")
+                    f"{job['t_start']}|{job['t_end']}|"
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{tb}|{bm}")
 
     # ------------------------------------------------------------------
     # CSV log
@@ -529,6 +561,7 @@ class CDHSABatchRunner:
                     "tasks": "+".join(job["tasks"]),
                     "L": job["cdhsa_params"].get("L", ""),
                     "fixed_rank": job["cdhsa_params"].get("fixed_rank", ""),
+                    "rank_method": job["cdhsa_params"].get("rank_method", "fixed"),
                     "hankel_depth": job["cdhsa_params"].get("hankel_depth", ""),
                     "t_start": job["t_start"],
                     "t_end": job["t_end"],
@@ -630,6 +663,57 @@ class CDHSABatchRunner:
             "--d-max-specific", str(cdhsa.get("d_max_specific", 10)),
         ])
 
+        # --- Mejoras v3 (solo se pasan si estan presentes/no-default) ---
+        if cdhsa.get("rank_method") == "variance":
+            cmd.extend([
+                "--var-explained", str(cdhsa.get("var_explained", 0.99)),
+                "--var-max-rank", str(cdhsa.get("var_max_rank", 50)),
+                "--var-min-rank", str(cdhsa.get("var_min_rank", 1)),
+            ])
+        if cdhsa.get("a6_max_common"):
+            cmd.extend(["--a6-max-common", str(cdhsa["a6_max_common"])])
+        if cdhsa.get("a6_null_type", "haar") != "haar":
+            cmd.extend(["--a6-null-type", str(cdhsa["a6_null_type"])])
+            if cdhsa.get("a6_hankel_row_block"):
+                cmd.extend([
+                    "--a6-hankel-row-block",
+                    str(cdhsa["a6_hankel_row_block"]),
+                ])
+        # (v4) Bloques tangentes: el default del pipeline ahora es
+        # 'cumulative' (paper 3.4); se pasa SIEMPRE que difiera de el.
+        if cdhsa.get("tangent_blocks_mode", "cumulative") != "cumulative":
+            cmd.extend([
+                "--tangent-blocks-mode",
+                str(cdhsa["tangent_blocks_mode"]),
+            ])
+        # (v4) Enmascaramiento de fronteras: default ON; solo se pasa el
+        # opt-out para reproducir ejecuciones pre-v4.
+        if cdhsa.get("no_boundary_mask", False):
+            cmd.append("--no-boundary-mask")
+        # (v4) Rango efectivo X% (Remark 3.6) y outcome del test de rango.
+        if cdhsa.get("effective_rank", False):
+            cmd.append("--effective-rank")
+        if cdhsa.get("rank_outcome", "selected") != "selected":
+            cmd.extend(["--rank-outcome", str(cdhsa["rank_outcome"])])
+        if cdhsa.get("d_rank_adaptive", False):
+            cmd.append("--d-rank-adaptive")
+        if "d_n_null_specific" in cdhsa:
+            cmd.extend([
+                "--d-n-null-specific", str(cdhsa["d_n_null_specific"]),
+            ])
+        if "d_alpha_specific" in cdhsa:
+            cmd.extend([
+                "--d-alpha-specific", str(cdhsa["d_alpha_specific"]),
+            ])
+        if cdhsa.get("d_loso", False):
+            cmd.append("--d-loso")
+            if "d_loso_n_perm" in cdhsa:
+                cmd.extend([
+                    "--d-loso-n-perm", str(cdhsa["d_loso_n_perm"]),
+                ])
+        if cdhsa.get("run_replica_consistency", False):
+            cmd.append("--run-replica-consistency")
+
         # Optional hankel depth
         if cdhsa.get("hankel_depth") is not None:
             cmd.extend(["--hankel-depth", str(cdhsa["hankel_depth"])])
@@ -654,6 +738,22 @@ class CDHSABatchRunner:
     # Output dir for a job (mirrors run_cdhsa.py _resolve_out_dir)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _rank_tag(cdhsa: dict) -> str:
+        """Etiqueta de rango para rutas y checkpoints.
+
+        Debe mantenerse sincronizada con
+        ``src.pipelines.run_cdhsa._rank_tag``.
+        """
+        rm = cdhsa.get("rank_method", "fixed")
+        if rm == "variance":
+            ve = float(cdhsa.get("var_explained", 0.99))
+            cap = cdhsa.get("var_max_rank", 50)
+            return f"var{round(ve * 100)}c{cap}"
+        if rm == "reproducibility":
+            return "repro"
+        return f"fr{cdhsa.get('fixed_rank', 10)}"
+
     def _get_output_dir(self, job: dict) -> Path:
         """Return the directory where the pipeline saves results.
 
@@ -671,7 +771,6 @@ class CDHSABatchRunner:
         t_end_tag = tw["t_end"] if tw["t_end"] != "None" else "any"
 
         L = cdhsa["L"]
-        fr = cdhsa.get("fixed_rank", 10)
         a6n = cdhsa.get("a6_n_null", 100)
         bcn = cdhsa.get("bc_n_perm", 5000)
         l_freq = cdhsa.get("l_freq", 1.0)
@@ -684,10 +783,12 @@ class CDHSABatchRunner:
         else:
             ss_label = f"SS{job['super_subject_id']}"
 
+        rtag = self._rank_tag(cdhsa)
+
         out_dir = Path(
             f"{self.output_dir}/cdhsa/{job['session']}"
             f"/{ss_label}_L{L}"
-            f"_fr{fr}_a6n{a6n}_bcn{bcn}"
+            f"_{rtag}_a6n{a6n}_bcn{bcn}"
             f"/{l_freq}-{h_freq}Hz"
             f"_depth{depth}"
             f"/from{t_start_tag}s_to{t_end_tag}s"

@@ -71,26 +71,41 @@ class CDHSAConfig:
     repro_strategy: str = "consecutive"
     max_common: int = 30
     prevalence_quantile: float = 0.10
+    # --- rank_method='variance': criterio X% de varianza explicada ---
+    var_explained: float = 0.99
+    var_max_rank: int = 50
+    var_min_rank: int = 1
     a6_max_common: int = 0
     a6_n_folds: int = 5
     a6_n_null: int = 100
     a6_alpha: float = 0.05
     a6_seed: int = 1234
+    a6_null_type: str = "haar"        # 'haar' | 'hankel' (Seccion 7 del paper)
+    a6_hankel_row_block: int = 0      # filas de X por canal; 0 = rotacion densa
     bc_blocks: list | None = None
     bc_energy_metric: str = "log_absolute"
-    bc_geometry_metric: str = "adjusted"
+    bc_geometry_metric: str = "adjusted"   # ||U^T W_k||²/j (paper, v4)
     bc_n_perm: int = 5000
     bc_seed: int = 20260812
     bc_alpha: float = 0.05
     bc_condition_names: list[str] = field(default_factory=list)
+    bc_rank_outcome: str = "selected"     # 'selected' | 'effective' (Remark 3.6)
+    effective_rank: bool = False          # estimador de rango efectivo X% (A1-A5)
     tangent_blocks: list | None = None
+    tangent_blocks_mode: str = "cumulative"  # 'omnibus' | 'cumulative' (paper 3.4)
     tangent_n_perm: int = 5000
     tangent_seed: int = 9999
     tangent_alpha: float = 0.05
     d_max_specific: int = 10
+    d_rank_adaptive: bool = False     # seleccion Haar de r_c (Def. 3.13)
+    d_n_null_specific: int = 100
+    d_alpha_specific: float = 0.05
+    d_loso: bool = False               # calibracion LOSO (Def. 3.15)
+    d_loso_n_perm: int = 1000
     d_residual_rank_method: str = "local_gap"
     d_residual_rank_threshold: float = 0.1
     d_fixed_residual_rank: int = 5
+    run_replica_consistency: bool = False  # Framework 2 (Seccion 4.5)
     skip_bc: bool = False
     skip_tangent: bool = False
     skip_d: bool = False
@@ -104,13 +119,16 @@ class CDHSAConfig:
 class CDHSAResult:
     """Container for all CD-HSA results."""
 
-    def __init__(self, config, R, A6=None, BC=None, G=None, D=None):
+    def __init__(self, config, R, A6=None, BC=None, G=None, D=None,
+                 D_loso=None, REPR=None):
         self.config = config
         self.R = R
         self.A6 = A6
         self.BC = BC
         self.G = G
         self.D = D
+        self.D_loso = D_loso
+        self.REPR = REPR
 
     def summary(self) -> str:
         lines = []
@@ -120,41 +138,130 @@ class CDHSAResult:
         lines.append(f"  Subjects: {R['S']}, Conditions: {R['C']}, "
                      f"Channels: {R['p']}, d = {R['d']}")
         lines.append(f"  Common directions estimated: {len(R['lambda_'])}")
+        if R.get('rank_method') == 'variance':
+            rk = np.asarray(R['rank'])
+            lines.append(
+                f"  Local rank (variance X={R['var_explained'] * 100:.1f}%): "
+                f"min={int(rk.min())}, median={int(np.median(rk))}, "
+                f"max={int(rk.max())}, "
+                f"censored={int(np.sum(R['var_censored']))}/{rk.size}"
+            )
+        names = (self.config.bc_condition_names
+                 or [f"Condition {c + 1}" for c in range(R['C'])])
         if self.A6 is not None:
-            lines.append(f"\n  A6 Common rank r0 = {self.A6['r0']}")
+            lines.append(f"\n  A6 Common rank r0 = {self.A6['r0']} "
+                         f"(null={self.config.a6_null_type})")
             if self.A6['r0'] > 0:
+                prev = R.get('prevalence')
                 for j in range(self.A6['r0']):
+                    pi_txt = ("" if prev is None or j >= len(prev)
+                              else f"  pi={prev[j]:.4f}")
                     lines.append(
-                        f"    j={j+1}: lambda={self.A6['lambda0'][j]:.4f}"
+                        f"    j={j+1}: lambda={self.A6['lambda0'][j]:.4f}{pi_txt}"
                     )
         if self.BC is not None:
             lines.append(f"\n  B/C Condition tests (alpha={self.config.bc_alpha}):")
+            rk_sum = self.BC.get('summary', {})
+            if 'rank_F' in rk_sum:
+                deg = rk_sum.get('rank_degenerate')
+                note = (" (degenerate: fixed-rank config, Remark 3.6)"
+                        if deg else "")
+                lines.append(
+                    f"    Rank test: F={float(np.atleast_1d(rk_sum['rank_F'])[0]):.2f}"
+                    f"  p={float(np.atleast_1d(rk_sum['rank_p_maxF'])[0]):.4f}{note}"
+                )
             for k, name in enumerate(self.BC['block_names']):
                 sig_e = "*" if self.BC['sig_energy_maxF'][k] else ""
                 sig_g = "*" if self.BC['sig_geometry_maxF'][k] else ""
+                eta_e = eta_g = ""
+                if 'energy_partial_eta_sq' in rk_sum:
+                    eta_e = f" (eta2={rk_sum['energy_partial_eta_sq'][k]:.2f})"
+                    eta_g = f" (eta2={rk_sum['geometry_partial_eta_sq'][k]:.2f})"
                 lines.append(
                     f"    {name}: energy_F="
                     f"{self.BC['summary']['energy_F'][k]:.2f}"
-                    f"{sig_e}  geom_F="
+                    f"{sig_e}{eta_e}  geom_F="
                     f"{self.BC['summary']['geometry_F'][k]:.2f}"
-                    f"{sig_g}"
+                    f"{sig_g}{eta_g}"
                 )
         if self.G is not None:
             lines.append(f"\n  Tangent geometry test:")
             for k in range(len(self.G['T_obs'])):
                 sig = "*" if self.G['sig_maxT'][k] else ""
+                idx = np.atleast_1d(self.G['blocks'][k])
+                blabel = (f"block {k+1} [{int(idx[0])}..{int(idx[-1])}]"
+                          if idx.size > 1 else f"block {k+1}")
                 lines.append(
-                    f"    block {k+1}: T={self.G['T_obs'][k]:.4f}"
+                    f"    {blabel}: T={self.G['T_obs'][k]:.4f}"
                     f"  p_maxT={self.G['p_maxT'][k]:.4f}{sig}"
                 )
         if self.D is not None:
-            lines.append(f"\n  D Condition-specific modes:")
+            rank_note = ("adaptive-Haar"
+                         if self.D.get('rank_adaptive')
+                         else f"cap={self.D.get('max_specific')}")
+            lines.append(f"\n  D Condition-specific modes (rank: {rank_note}):")
             for c in range(self.D['C']):
                 rc = self.D['r_specific'][c]
                 pc = self.D['prevalence_contrast'][c]
+                cname = names[c] if c < len(names) else f"Condition {c+1}"
                 lines.append(
-                    f"    Condition {c+1}: {rc} modes,"
+                    f"    {cname}: {rc} modes,"
                     f"  prevalence contrast = {pc:.4f}"
+                )
+        if self.D_loso is not None:
+            lines.append(
+                f"\n  D LOSO prevalence contrast "
+                f"(Def. 3.15, n_perm={self.D_loso['n_perm']}):"
+            )
+            for c in range(len(self.D_loso['delta_loso'])):
+                dlt = self.D_loso['delta_loso'][c]
+                pv = self.D_loso['p_loso'][c]
+                sig = "*" if self.D_loso['sig_loso'][c] else ""
+                cname = names[c] if c < len(names) else f"Condition {c+1}"
+                lines.append(
+                    f"    {cname}: Delta_loso={dlt:.4f}  p={pv:.4f}{sig}"
+                )
+        if self.REPR is not None:
+            S = self.REPR['S']
+            lines.append(f"\n  Replica consistency (Framework 2, >=4/5 of {S}):")
+            bb = self.REPR['backbone']
+            lines.append(
+                "    Backbone overlap: "
+                + ", ".join(f"{v:.3f}" for v in bb['overlap'])
+                + f" (ref random {bb['ref_random']:.3f})"
+                + f" -> {bb['n_above_ref']}/{S}"
+            )
+            en = self.REPR.get('energy')
+            if en is not None:
+                if 'n_sign_consistent' in en:
+                    ok = en['consistent_4of5']
+                    lines.append(
+                        f"    Energy shifts (C=2): consistent in "
+                        f"{int(np.sum(ok))}/{len(ok)} directions"
+                    )
+                elif 'n_dominant_match' in en:
+                    ok = en['consistent_4of5']
+                    lines.append(
+                        f"    Energy dominant condition: consistent in "
+                        f"{int(np.sum(ok))}/{len(ok)} directions"
+                    )
+            de = self.REPR.get('deformation')
+            if de is not None:
+                med = np.median(de['T_replica'], axis=0)
+                txt = ", ".join(f"{v:.3g}" for v in med[:5])
+                txt += "..." if len(med) > 5 else ""
+                lines.append(f"    Deformation median T^(s) per block: {txt}")
+                cs = de.get('cosine_similarity')
+                if cs is not None:
+                    txt2 = ", ".join(f"{v:.2f}" for v in cs[:5])
+                    txt2 += "..." if len(cs) > 5 else ""
+                    lines.append(f"    Deformation direction cosine: {txt2}")
+            di = self.REPR.get('discriminability')
+            if di is not None:
+                lines.append(
+                    "    Discriminability Delta^(s): "
+                    + ", ".join(f"{v:.3f}" for v in di['delta_replica'])
+                    + f" -> {di['n_positive']}/{S}"
                 )
         return "\n".join(lines)
 
@@ -167,6 +274,7 @@ def run_cdhsa(
     X: list[list[NDArray[np.floating]]],
     L: int,
     config: CDHSAConfig | None = None,
+    col_masks: list | None = None,
 ) -> CDHSAResult:
     """Run the full CD-HSA pipeline.
 
@@ -176,8 +284,14 @@ def run_cdhsa(
         X[s][c] is the data matrix (e.g. Hankel) for subject s,
         condition c, with shape (p, T).
     L : int
-        Subspace dimension to analyse.
+        Second-level embedding depth (L_bh of the paper).
     config : CDHSAConfig, optional
+    col_masks : list of list of arrays or None
+        Máscaras de columnas de nivel 2 por grabación (ver
+        ``a_common_subspace.level2_boundary_mask``): excluyen las
+        ventanas que cruzan fronteras de concatenación entre sujetos.
+        Se aplican en A1-A5, en la energía del Step B y en el nulo
+        Hankel-preservante. None = sin enmascarar.
 
     Returns
     -------
@@ -187,7 +301,11 @@ def run_cdhsa(
     from src.cdhsa.a6_common_rank import cdhsa_A6_common_rank
     from src.cdhsa.b_energy import cdhsa_BC_condition_tests
     from src.cdhsa.c_geometry import cdhsa_tangent_geometry_test
-    from src.cdhsa.d_condition_specific import cdhsa_D_condition_specific_modes
+    from src.cdhsa.d_condition_specific import (
+        cdhsa_D_condition_specific_modes,
+        cdhsa_D_prevalence_loso,
+    )
+    from src.cdhsa.replica_consistency import cdhsa_replica_consistency
 
     if config is None:
         config = CDHSAConfig()
@@ -202,21 +320,37 @@ def run_cdhsa(
         repro_strategy=config.repro_strategy,
         max_common=config.max_common,
         prevalence_quantile=config.prevalence_quantile,
+        var_explained=config.var_explained,
+        var_max_rank=config.var_max_rank,
+        var_min_rank=config.var_min_rank,
+        col_masks=col_masks,
+        effective_rank=config.effective_rank,
     )
 
+    # A6: a6_max_common = 0 => todos los candidatos de A1-A5
+    # (evita censurar r0 en un tope arbitrario, p.ej. 20).
     a6_max = (config.a6_max_common if config.a6_max_common > 0
-             else min(20, len(R['lambda_'])))
-    A6 = cdhsa_A6_common_rank(R, opts={
+             else min(config.max_common, len(R['lambda_'])))
+    a6_opts = {
         'max_common': a6_max,
         'n_folds': config.a6_n_folds,
         'n_null': config.a6_n_null,
         'alpha': config.a6_alpha,
         'seed': config.a6_seed,
-    })
+        'null_type': config.a6_null_type,
+    }
+    if config.a6_null_type == 'hankel':
+        a6_opts['X'] = X
+        a6_opts['L_hankel'] = L
+        a6_opts['hankel_row_block'] = config.a6_hankel_row_block
+        a6_opts['col_masks'] = col_masks
+    A6 = cdhsa_A6_common_rank(R, opts=a6_opts)
 
     BC = None
     G = None
     D = None
+    D_loso = None
+    REPR = None
 
     if not config.skip_bc and A6['r0'] >= 1:
         bc_opts = {
@@ -226,6 +360,7 @@ def run_cdhsa(
             'n_perm': config.bc_n_perm,
             'seed': config.bc_seed,
             'alpha': config.bc_alpha,
+            'rank_outcome': config.bc_rank_outcome,
         }
         if config.bc_condition_names:
             bc_opts['condition_names'] = config.bc_condition_names
@@ -234,7 +369,22 @@ def run_cdhsa(
     if not config.skip_tangent and A6['r0'] >= 1:
         t_blocks = config.tangent_blocks
         if t_blocks is None:
-            t_blocks = [np.arange(1, A6['r0'] + 1, dtype=int)]
+            min_rank = int(np.min(R['rank']))
+            if config.tangent_blocks_mode == 'cumulative':
+                # Bloques acumulativos B_k = {1..k}, k = 1..kmax
+                # (paper 3.4). kmax = min(r0, min r_sc): el bloque no
+                # puede ser mas ancho que el rango local minimo.
+                kmax = min(A6['r0'], min_rank)
+                t_blocks = [np.arange(1, k + 1, dtype=int)
+                            for k in range(1, kmax + 1)]
+            else:
+                # Omnibus {1..r0}, recortado al rango local minimo si
+                # hace falta (rangos ragged, p.ej. variance).
+                if A6['r0'] > min_rank:
+                    print(f"  [WARN] tangent omnibus {A6['r0']} > min rango "
+                          f"local {min_rank}: bloque recortado a {min_rank}.")
+                t_blocks = [np.arange(1, min(A6['r0'], min_rank) + 1,
+                                      dtype=int)]
         G = cdhsa_tangent_geometry_test(R, A6, blocks=t_blocks, opts={
             'n_perm': config.tangent_n_perm,
             'seed': config.tangent_seed,
@@ -248,9 +398,29 @@ def run_cdhsa(
             'residual_rank_threshold': config.d_residual_rank_threshold,
             'fixed_residual_rank': config.d_fixed_residual_rank,
             'prevalence_quantile': config.prevalence_quantile,
+            'rank_adaptive': config.d_rank_adaptive,
+            'n_null_specific': config.d_n_null_specific,
+            'alpha_specific': config.d_alpha_specific,
         })
+        if config.d_loso:
+            if R['S'] < 2:
+                print("  [WARN] d_loso omitido: S < 2 (no hay sujetos que "
+                      "dejar fuera).")
+            else:
+                D_loso = cdhsa_D_prevalence_loso(D, opts={
+                    'n_perm': config.d_loso_n_perm,
+                    'alpha': config.bc_alpha,
+                })
 
-    return CDHSAResult(config=config, R=R, A6=A6, BC=BC, G=G, D=D)
+    if config.run_replica_consistency and A6['r0'] >= 1:
+        if R['S'] < 2:
+            print("  [WARN] replica_consistency omitido: Framework 2 "
+                  "requiere S >= 2.")
+        else:
+            REPR = cdhsa_replica_consistency(R, A6, BC=BC, G=G, D=D)
+
+    return CDHSAResult(config=config, R=R, A6=A6, BC=BC, G=G, D=D,
+                       D_loso=D_loso, REPR=REPR)
 
 
 # =====================================================================
@@ -296,7 +466,10 @@ def build_hankel_from_eeg(
     X : list[list[NDArray]]
         X[s][c] = Hankel para super-sujeto s, condicion c.
     info : dict
-        Metadata completa de la construccion.
+        Metadata completa de la construccion. Incluye
+        ``member_n_times[s][c]`` (muestras de cada sujeto miembro tras
+        recorte+filtro) para el enmascaramiento de fronteras de nivel 2
+        (ver ``a_common_subspace.level2_boundary_mask``).
     """
     from src.latent_space_extraction.super_subject_eeg import (
         load_super_subject_eeg,
@@ -346,6 +519,7 @@ def build_hankel_from_eeg(
     sys.stdout.flush()
 
     raws_store: dict[tuple[int, int], "mne.io.Raw"] = {}  # (ss_idx, c_idx) -> raw
+    raws_member_lengths: dict[tuple[int, int], list[int]] = {}
     ss_member_ids: dict[int, list[int]] = {}
     load_errors: list[tuple[int, int, str]] = []
 
@@ -365,7 +539,7 @@ def build_hankel_from_eeg(
             sys.stdout.flush()
 
             try:
-                raw = load_super_subject_eeg(
+                raw, member_lengths = load_super_subject_eeg(
                     super_subject_id=ss_id,
                     session=session,
                     task=task,
@@ -376,6 +550,7 @@ def build_hankel_from_eeg(
                     t_stop=t_stop,
                     preload=True,
                     verbose=False,
+                    return_member_lengths=True,
                 )
             except (FileNotFoundError, ValueError) as exc:
                 print(f"SKIP ({exc})")
@@ -383,6 +558,7 @@ def build_hankel_from_eeg(
                 continue
 
             raws_store[(ss_id - 1, c_idx)] = raw
+            raws_member_lengths[(ss_id - 1, c_idx)] = member_lengths
             print(f"OK  ch={len(raw.ch_names)} dur={raw.times[-1]:.0f}s")
             sys.stdout.flush()
 
@@ -422,6 +598,7 @@ def build_hankel_from_eeg(
     skipped: list[tuple[int, int, str]] = list(load_errors)
     super_subject_ids_list: list[list[int]] = []
     durations: list[float] = []
+    member_n_times_all: list[list[list[int] | None]] = []
 
     t0_global = time.time()
 
@@ -429,6 +606,7 @@ def build_hankel_from_eeg(
         ss_label = f"super_subject-{ss_id:02d}"
         X_s: list[NDArray[np.floating]] = []
         shapes_s: list[tuple[int, int] | None] = []
+        members_s: list[list[int] | None] = []
         member_ids = ss_member_ids[ss_id]
         super_subject_ids_list.append(member_ids)
 
@@ -442,9 +620,12 @@ def build_hankel_from_eeg(
                 print(f"  {tag} SKIP (error en carga)")
                 X_s.append(np.empty((0, 0)))
                 shapes_s.append(None)
+                members_s.append(None)
                 continue
 
             raw = raws_store.pop(key)  # liberar memoria
+            # Longitudes de los miembros (para la mascara de fronteras)
+            member_n_times_sc = raws_member_lengths.pop(key, None)
             print(f"  {tag} ...", end=" ")
             sys.stdout.flush()
 
@@ -471,15 +652,24 @@ def build_hankel_from_eeg(
                 print(f"SKIP (depth={depth} >= n_times={n_times})")
                 X_s.append(np.empty((0, 0)))
                 shapes_s.append(None)
+                members_s.append(None)
                 skipped.append((ss_id - 1, c_idx,
                     f"depth={depth} >= n_times={n_times}"))
                 continue
+
+            # Coherencia de las longitudes de miembros con el stream filtrado
+            if member_n_times_sc is not None and sum(member_n_times_sc) != n_times:
+                print(f"\n  [WARN] sum(member_n_times)={sum(member_n_times_sc)} "
+                      f"!= n_times={n_times}: la mascara de fronteras NO "
+                      f"se usara para (s={ss_id - 1}, c={c_idx}).")
+                member_n_times_sc = None
 
             H = _build_multivariate_hankel(X_filtered, depth)
             del X_filtered  # liberar memoria
 
             X_s.append(H)
             shapes_s.append(H.shape)
+            members_s.append(member_n_times_sc)
             sfreqs.append(sfreq)
             depths_used.append(depth)
             n_channels_list.append(n_ch)
@@ -488,11 +678,13 @@ def build_hankel_from_eeg(
 
             print(f"OK  ch={n_ch} T={n_times} "
                   f"dur={duration_s:.0f}s "
-                  f"depth={depth} -> H={H.shape}")
+                  f"depth={depth} -> H={H.shape} "
+                  f"(miembros: {len(member_n_times_sc) if member_n_times_sc else 1})")
             sys.stdout.flush()
 
         X.append(X_s)
         shapes.append(shapes_s)
+        member_n_times_all.append(members_s)
 
     # Liberar cualquier raw residual
     raws_store.clear()
@@ -521,6 +713,7 @@ def build_hankel_from_eeg(
         "n_times_filtered": n_times_filtered_list,
         "durations": durations,
         "skipped": skipped,
+        "member_n_times": member_n_times_all,
         "elapsed_load": time.time() - t0_load,
         "elapsed_build": elapsed,
     }
@@ -609,6 +802,7 @@ def build_hankel_single_ss(
     durations: list[float] = []
     skipped: list[tuple[int, int, str]] = []
     ch_names: list[str] = []
+    member_n_times_list: list[list[int] | None] = []
 
     t0 = time.time()
 
@@ -618,7 +812,7 @@ def build_hankel_single_ss(
         sys.stdout.flush()
 
         try:
-            raw = load_super_subject_eeg(
+            raw, member_n_times = load_super_subject_eeg(
                 super_subject_id=super_subject_id,
                 session=session,
                 task=task,
@@ -629,11 +823,13 @@ def build_hankel_single_ss(
                 t_stop=t_stop,
                 preload=True,
                 verbose=False,
+                return_member_lengths=True,
             )
         except (FileNotFoundError, ValueError) as exc:
             print(f"SKIP ({exc})")
             X_s.append(np.empty((0, 0)))
             shapes_s.append(None)
+            member_n_times_list.append(None)
             skipped.append((0, c_idx, str(exc)))
             continue
 
@@ -666,15 +862,24 @@ def build_hankel_single_ss(
             print(f"SKIP (depth={depth} >= n_times={n_times})")
             X_s.append(np.empty((0, 0)))
             shapes_s.append(None)
+            member_n_times_list.append(None)
             skipped.append((0, c_idx,
                 f"depth={depth} >= n_times={n_times}"))
             continue
+
+        # Coherencia de las longitudes de miembros con el stream filtrado
+        if member_n_times is not None and sum(member_n_times) != n_times:
+            print(f"\n  [WARN] sum(member_n_times)={sum(member_n_times)} "
+                  f"!= n_times={n_times}: la mascara de fronteras NO "
+                  f"se usara para (c={c_idx}).")
+            member_n_times = None
 
         H = _build_multivariate_hankel(X_filtered, depth)
         del X_filtered
 
         X_s.append(H)
         shapes_s.append(H.shape)
+        member_n_times_list.append(member_n_times)
         sfreqs.append(sfreq)
         depths_used.append(depth)
         n_channels_list.append(n_ch)
@@ -708,6 +913,7 @@ def build_hankel_single_ss(
         "n_times_filtered": n_times_filtered_list,
         "durations": durations,
         "skipped": skipped,
+        "member_n_times": [member_n_times_list],
         "elapsed_build": elapsed,
     }
     if sfreqs:
@@ -868,7 +1074,10 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     # --- CDHSA ---
     parser.add_argument(
         "--L", type=int, required=True,
-        help="Dimension del subespacio para CD-HSA",
+        help=("Profundidad del embedding Hankel de SEGUNDO nivel (el L_bh "
+              "del paper): construye la matriz de nivel 2 "
+              "(p*L, K) sobre la que viven W0/W_specific. NO es la "
+              "dimension de un subespacio."),
     )
 
     # --- Preprocesamiento ---
@@ -885,12 +1094,72 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g = parser.add_argument_group("Parametros CDHSA")
     g.add_argument("--fixed-rank", type=int, default=10)
     g.add_argument("--rank-method", type=str, default="fixed",
-                   choices=["fixed", "reproducibility"])
+                   choices=["fixed", "reproducibility", "variance"],
+                   help="Metodo de seleccion del rango local. "
+                        "'variance': menor r que explica --var-explained "
+                        "de la energia Hankel (por grabacion; revive el "
+                        "test de rango del Step B).")
+    g.add_argument("--var-explained", type=float, default=0.99,
+                   help="Fraccion de varianza para rank-method=variance "
+                        "(X%%, p.ej. 0.99). Default: 0.99")
+    g.add_argument("--var-max-rank", type=int, default=50,
+                   help="Tope de candidatos para rank-method=variance. "
+                        "Default: 50")
+    g.add_argument("--var-min-rank", type=int, default=1,
+                   help="Piso de rango local para rank-method=variance. "
+                        "Default: 1")
     g.add_argument("--a6-n-null", type=int, default=100)
+    g.add_argument("--a6-max-common", type=int, default=0,
+                   help="Candidatos a testear en A6. 0 = todos los de "
+                        "A1-A5 (evita censurar r0).")
+    g.add_argument("--a6-null-type", type=str, default="haar",
+                   choices=["haar", "hankel"],
+                   help="Nulo del criterio dual. 'hankel' = rotacion "
+                        "de canales que preserva la estructura de "
+                        "retardo (Seccion 7 del paper; mas caro).")
+    g.add_argument("--a6-hankel-row-block", type=int, default=0,
+                   help="Filas de X por canal para el nulo hankel "
+                        "(= hankel_depth del primer nivel; el pipeline "
+                        "lo autodetecta desde la info de construccion).")
     g.add_argument("--bc-n-perm", type=int, default=5000)
+    g.add_argument("--effective-rank", action="store_true",
+                   help="Calcular ademas un rango efectivo X%% por "
+                        "grabacion (A1-A5) y guardarlo en "
+                        "R['rank_effective']; habilita --rank-outcome "
+                        "effective para el test de rango (Remark 3.6).")
+    g.add_argument("--rank-outcome", type=str, default="selected",
+                   choices=["selected", "effective"],
+                   help="Resultado del test de rango del Step B: el rango "
+                        "primario ('selected') o el efectivo X%% "
+                        "('effective'; requiere --effective-rank).")
+    g.add_argument("--no-boundary-mask", action="store_true",
+                   help="Desactivar el enmascaramiento de columnas de "
+                        "nivel 2 que cruzan fronteras de concatenacion "
+                        "entre sujetos (paper: se descartan; a lo sumo "
+                        "L+depth-2 por frontera). Default: activado.")
+    g.add_argument("--tangent-blocks-mode", type=str, default="cumulative",
+                   choices=["omnibus", "cumulative"],
+                   help="Bloques del test tangente: 'cumulative' = "
+                        "B_k={1..k}, k=1..min(r0, r) con max-T sobre "
+                        "la familia (paper 3.4, default); 'omnibus' = "
+                        "un solo bloque {1..r0}.")
     g.add_argument("--d-max-specific", type=int, default=10,
                    help="Maximos modos especificos por condicion (Step D). "
-                   "Default: 10")
+                        "Default: 10")
+    g.add_argument("--d-rank-adaptive", action="store_true",
+                   help="Seleccionar r_c por test Haar consecutivo (Def. "
+                        "3.13) en vez del tope fijo.")
+    g.add_argument("--d-n-null-specific", type=int, default=100,
+                   help="Replicas del nulo Haar de Step D. Default: 100")
+    g.add_argument("--d-alpha-specific", type=float, default=0.05)
+    g.add_argument("--d-loso", action="store_true",
+                   help="Calibracion LOSO del contraste de prevalencia "
+                        "(Def. 3.15 del paper).")
+    g.add_argument("--d-loso-n-perm", type=int, default=1000,
+                   help="Permutaciones del nulo LOSO. Default: 1000")
+    g.add_argument("--run-replica-consistency", action="store_true",
+                   help="Consistencia por replica (Framework 2, Seccion "
+                        "4.5 del paper, criterio >=4/5).")
     g.add_argument("--skip-bc", action="store_true")
     g.add_argument("--skip-tangent", action="store_true")
     g.add_argument("--skip-d", action="store_true")
@@ -926,13 +1195,27 @@ def _json_safe(obj: Any) -> Any:
     return obj
 
 
+def _rank_tag(rank_method: str, fixed_rank: int,
+              var_explained: float, var_max_rank: int) -> str:
+    """Etiqueta de rango para el nombre del directorio de salida.
+
+    Debe mantenerse sincronizada con
+    ``run_batch_cdhsa.CDHSABatchRunner._rank_tag``.
+    """
+    if rank_method == "variance":
+        return f"var{round(var_explained * 100)}c{var_max_rank}"
+    if rank_method == "reproducibility":
+        return "repro"
+    return f"fr{fixed_rank}"
+
+
 def _resolve_out_dir(args: argparse.Namespace) -> Path:
     """Resolver el directorio de salida y crear la subcarpeta.
 
     Estructura::
 
         {BASE_RESULTS_PATH}/cdhsa/{session}/
-            nSS{n}_L{L}_fr{fr}_a6n{a6}_bcn{bc}/
+            nSS{n}_L{L}_{ranktag}_a6n{a6}_bcn{bc}/
             {l_freq}-{h_freq}Hz_depth{d}/
     """
     base = args.out_dir
@@ -954,10 +1237,13 @@ def _resolve_out_dir(args: argparse.Namespace) -> Path:
     else:
         ss_label = f"nSS{args.n_super_subjects}"
 
+    rtag = _rank_tag(args.rank_method, args.fixed_rank,
+                     args.var_explained, args.var_max_rank)
+
     out_dir = Path(
         f"{base}/cdhsa/{args.session}"
         f"/{ss_label}_L{args.L}"
-        f"_fr{args.fixed_rank}_a6n{args.a6_n_null}_bcn{args.bc_n_perm}"
+        f"_{rtag}_a6n{args.a6_n_null}_bcn{args.bc_n_perm}"
         f"/{args.l_freq}-{args.h_freq}Hz"
         f"_depth{args.hankel_depth or 'auto'}"
         f"/from{t_start_tag}_to{t_end_tag}"
@@ -965,6 +1251,69 @@ def _resolve_out_dir(args: argparse.Namespace) -> Path:
     )
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
+
+
+def _compute_col_masks(
+    X: list[list[NDArray[np.floating]]],
+    hankel_info: dict,
+    L: int,
+) -> list[list[NDArray[np.bool_] | None]] | None:
+    """
+    Computa las máscaras de columnas de nivel 2 desde la metadata.
+
+    Usa ``hankel_info['member_n_times'][s][c]`` (muestras por sujeto
+    miembro) y el depth del primer nivel, que se recupera como
+    ``depth = T_total - T_nivel1 + 1`` (no hace falta confiar en los
+    registros planos de depths_used). Una grabación con un solo
+    miembro no tiene fronteras internas -> máscara None (sin coste).
+
+    Returns
+    -------
+    masks : list of list of arrays or None, o None si no hay metadata
+        de miembros (resultados pre-v4 o pipelines sin concatenación).
+    """
+    from src.cdhsa.a_common_subspace import level2_boundary_mask
+
+    member_info = hankel_info.get('member_n_times')
+    if not member_info:
+        print("  [WARN] hankel_info sin member_n_times: no se pueden "
+              "enmascarar las fronteras de concatenacion (ejecucion "
+              "pre-v4 o datos de un solo sujeto por grabacion).")
+        return None
+
+    S = len(X)
+    C = len(X[0])
+    if len(member_info) != S:
+        print(f"  [WARN] member_n_times tiene {len(member_info)} filas "
+              f"pero S={S}: sin enmascaramiento.")
+        return None
+
+    masks: list[list[NDArray[np.bool_] | None]] = []
+    n_masked = 0
+    for s in range(S):
+        row: list[NDArray[np.bool_] | None] = []
+        for c in range(C):
+            members = member_info[s][c] if c < len(member_info[s]) else None
+            if (members is None or len(members) <= 1
+                    or X[s][c].size == 0):
+                row.append(None)
+                continue
+            T_total = int(sum(members))
+            T1 = int(X[s][c].shape[1])
+            depth = T_total - T1 + 1
+            if depth < 1:
+                print(f"  [WARN] depth inconsistente en (s={s}, c={c}): "
+                      f"T_total={T_total}, T1={T1}: sin mascara.")
+                row.append(None)
+                continue
+            mask = level2_boundary_mask(members, depth, L)
+            row.append(mask)
+            n_masked += int(np.sum(~mask))
+        masks.append(row)
+
+    print(f"  [Fronteras] {n_masked} columnas de nivel 2 seran "
+          f"descartadas (ventanas que cruzan sujetos).")
+    return masks
 
 
 def save_results(
@@ -1038,6 +1387,29 @@ def save_results(
         _save_result_arrays(result.G, "G", arrays_dict)
     if result.D is not None:
         _save_result_arrays(result.D, "D", arrays_dict)
+    if result.D_loso is not None:
+        _save_result_arrays(result.D_loso, "D_loso", arrays_dict)
+    if result.REPR is not None:
+        _save_result_arrays(result.REPR, "REPR", arrays_dict)
+
+    # --- 7. mascaras de fronteras (colmask_ss{s}_c{c}) ---
+    # Se guardan aparte porque el aplanador generico no preserva la
+    # estructura (lista de listas de arrays). extract_mode_indices las
+    # usa para poner alpha=0 en las columnas que cruzan sujetos.
+    col_masks = result.R.get('col_masks')
+    if col_masks is not None:
+        n_masks = 0
+        for s in range(len(col_masks)):
+            for c in range(len(col_masks[s])):
+                m = col_masks[s][c]
+                if m is None:
+                    continue
+                arrays_dict[f'colmask_ss{s + 1}_c{c + 1}'] = np.asarray(m)
+                n_masks += 1
+        if n_masks:
+            print(f"    [OK] {n_masks} mascaras de fronteras en "
+                  f"cdhsa_arrays.npz (colmask_ss*_c*)")
+
     np.savez_compressed(out_dir / "cdhsa_arrays.npz", **arrays_dict)
     print(f"    [OK] cdhsa_arrays.npz  ({len(arrays_dict)} arrays)")
 
@@ -1060,6 +1432,13 @@ def _save_result_arrays(
                 arr = np.array(v)
                 if arr.dtype.kind in ("f", "i", "u", "b"):
                     out[key] = arr
+                elif arr.dtype.kind == "O":
+                    # Ragged (p.ej. r_c distinto por condicion en Step D):
+                    # guardar cada elemento con clave indexada
+                    # (D__W_specific__0, D__W_specific__1, ...).
+                    for i, item in enumerate(v):
+                        if isinstance(item, np.ndarray):
+                            out[f"{key}__{i}"] = item
             except (ValueError, TypeError):
                 pass
 
@@ -1132,15 +1511,50 @@ def main(argv: list[str] | None = None) -> int:
     cfg = CDHSAConfig(
         fixed_rank=args.fixed_rank,
         rank_method=args.rank_method,
+        var_explained=args.var_explained,
+        var_max_rank=args.var_max_rank,
+        var_min_rank=args.var_min_rank,
         a6_n_null=args.a6_n_null,
+        a6_max_common=args.a6_max_common,
+        a6_null_type=args.a6_null_type,
+        a6_hankel_row_block=args.a6_hankel_row_block,
         bc_n_perm=args.bc_n_perm,
         bc_condition_names=list(args.tasks),
+        bc_rank_outcome=args.rank_outcome,
+        effective_rank=args.effective_rank,
+        tangent_blocks_mode=args.tangent_blocks_mode,
         d_max_specific=args.d_max_specific,
+        d_rank_adaptive=args.d_rank_adaptive,
+        d_n_null_specific=args.d_n_null_specific,
+        d_alpha_specific=args.d_alpha_specific,
+        d_loso=args.d_loso,
+        d_loso_n_perm=args.d_loso_n_perm,
+        run_replica_consistency=args.run_replica_consistency,
         skip_bc=args.skip_bc,
         skip_tangent=args.skip_tangent,
         skip_d=args.skip_d,
     )
 
+    # Nulo Hankel-preservante: autodetectar las filas de X por canal
+    # (= depth del primer nivel, layout canal-major de la Hankel de
+    # _build_multivariate_hankel) para la rotacion I_{L1} (x) Q fiel al
+    # paper (Seccion 7).
+    if cfg.a6_null_type == 'hankel' and cfg.a6_hankel_row_block == 0:
+        depth_common = hankel_info.get('depth_common')
+        if depth_common:
+            cfg.a6_hankel_row_block = int(depth_common)
+            print(f"  [a6-null=hankel] row_block autodetectado: "
+                  f"{cfg.a6_hankel_row_block} (canales: "
+                  f"{hankel_info.get('n_channels_common')})")
+        else:
+            print("  [WARN] a6-null-type=hankel sin row_block: no se pudo "
+                  "autodetectar el depth del primer nivel; se usara "
+                  "rotacion densa (legacy).")
+
+    # --- Mascara de fronteras de concatenacion (paper, default ON) ---
+    col_masks = None
+    if not args.no_boundary_mask:
+        col_masks = _compute_col_masks(X, hankel_info, args.L)
     S = len(X)
     print("\n" + "=" * 70)
     print("  EJECUTANDO CD-HSA")
@@ -1154,16 +1568,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Subjects por SS       : {args.total_subjects // args.n_super_subjects}")
     print(f"  S (matrices)          : {S}")
     print(f"  Condiciones (C)       : {len(args.tasks)}")
-    print(f"  L (subespacio)        : {args.L}")
-    print(f"  fixed_rank            : {cfg.fixed_rank}")
-    print(f"  a6_n_null             : {cfg.a6_n_null}")
+    print(f"  L (embedding nivel 2) : {args.L}")
+    if col_masks is not None:
+        n_drop = sum(
+            int(np.sum(~np.asarray(m).astype(bool)))
+            for row in col_masks for m in row if m is not None
+        )
+        print(f"  Mascara de fronteras  : ON ({n_drop} columnas de nivel 2 "
+              f"descartadas)")
+    else:
+        print("  Mascara de fronteras  : OFF (--no-boundary-mask o sin "
+              "member_n_times)")
+    if cfg.rank_method == 'variance':
+        print(f"  rank_method           : variance (X={cfg.var_explained*100:.1f}%, "
+              f"cap={cfg.var_max_rank}, piso={cfg.var_min_rank})")
+    else:
+        print(f"  rank_method           : {cfg.rank_method}")
+        print(f"  fixed_rank            : {cfg.fixed_rank}")
+    if cfg.effective_rank:
+        print(f"  Rango efectivo X%     : ON (rank_outcome={cfg.bc_rank_outcome})")
+    print(f"  a6_n_null             : {cfg.a6_n_null} (null={cfg.a6_null_type})")
     print(f"  bc_n_perm             : {cfg.bc_n_perm}")
+    print(f"  tangent_blocks        : {cfg.tangent_blocks_mode}")
+    print(f"  d_max_specific       : {cfg.d_max_specific} "
+          f"(adaptive={cfg.d_rank_adaptive}, loso={cfg.d_loso})")
+    if cfg.run_replica_consistency:
+        print(f"  replica_consistency  : True (>=4/5)")
     if out_dir is not None:
         print(f"  Out dir               : {out_dir}")
     print("")
     sys.stdout.flush()
 
-    result = run_cdhsa(X, args.L, cfg)
+    result = run_cdhsa(X, args.L, cfg, col_masks=col_masks)
 
     # 4. Resultados
     print("")

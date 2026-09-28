@@ -23,6 +23,35 @@ from numpy.typing import NDArray
 
 
 # ============================================================================
+# Helper: Haar-random orthonormal basis (Mezzadri 2007)
+# ============================================================================
+
+def haar_random_basis(
+    rng: np.random.Generator,
+    d: int,
+    r: int,
+) -> NDArray[np.floating]:
+    """
+    Orthonormal basis (d, r) distribuida según la medida Haar de V_{d,r}.
+
+    ``np.linalg.qr`` sin corrección NO produce una distribución Haar:
+    sus columnas tienen signos aleatorios sesgados (Mezzadri 2007,
+    "How to generate random matrices from the classical compact groups",
+    Not. AMS). La corrección estándar multiplica cada columna j de Q por
+    el signo de R[j, j].
+
+    Usada por ``random_subspace_null``, ``hankel_preserving_null`` y el
+    nulo Haar de Step D; corregir el muestreo elimina un sesgo sutil en
+    los cuantiles del nulo (más notable con pocos replicados).
+    """
+    Z = rng.standard_normal((d, r))
+    Q, R = np.linalg.qr(Z)
+    sgns = np.sign(np.diag(R))
+    sgns[sgns == 0.0] = 1.0
+    return Q * sgns
+
+
+# ============================================================================
 # Helper: population common basis from a cell of local bases
 # ============================================================================
 
@@ -49,7 +78,9 @@ def common_basis_from_U(
     W : ndarray, shape (d, q)
         Population common basis (columns orthonormal), q = min(max_r, d, Σr_sc).
     lambda_ : ndarray, shape (q,)
-        Commonality eigenvalues λ_j = σ_j²(B) where B = [U₁...U_N]/√N.
+        Commonality values λ_j = σ_j(B) — the SINGULAR VALUES of
+        B = [U₁...U_N]/√N (paper convention: λ_j is a singular value,
+        not its square; see also ``cdhsa_A1_A5`` step A3).
 
     Notes
     -----
@@ -72,8 +103,9 @@ def common_basis_from_U(
 
     U_B, s_B, _ = np.linalg.svd(B, full_matrices=False)
     W = U_B[:, :q]
-    lambda_ = s_B[:q] ** 2
-    lambda_ = np.clip(lambda_, 0.0, 1.0)
+    # Paper: λ_j = σ_j(B) (valor singular, no su cuadrado). Homogéneo con
+    # Step D (lambda_specific = sv) y con Def. 3.13 del paper.
+    lambda_ = np.clip(s_B[:q], 0.0, 1.0)
 
     return W, lambda_
 
@@ -98,10 +130,13 @@ def crossvalidate_common_rank(
 
     The output includes condition-specific held-out scores and::
 
-        CV_min(r) = min_c mean_f score_{f,c}(r)
+        CV_min(r) = mean_folds( min_c score_{f,c}(r) )
 
-    which is deliberately strict: a direction is not called common if it
-    generalizes only to one condition.
+    The minimum over conditions is taken WITHIN each fold and then
+    averaged over folds (the paper's cv-min equation). This is strictly
+    harder than min_c(mean_f): the retained fold score is always the
+    WORST condition of that fold, so a direction must generalize to all
+    conditions in every held-out fold.
 
     Parameters
     ----------
@@ -120,24 +155,30 @@ def crossvalidate_common_rank(
         fold_id : ndarray (S,) — fold assignment per subject
         fold_score : ndarray (n_folds, nr)
         condition_score : ndarray (n_folds, C, nr)
+        fold_min_condition : ndarray (n_folds, nr) — min over conditions
+            within each fold (the inner step of the paper's cv-min eq.).
         mean : ndarray (nr,) — overall mean CV score
         mean_condition : ndarray (C, nr) or (1, nr) if C=1
-        min_condition : ndarray (nr,) — CV_min(r)
+        min_condition : ndarray (nr,) — CV_min(r) = mean_folds(min_c)
 
     CRITICAL ANALYSIS vs MATLAB
     ---------------------------
-    Faithful translation of ``crossvalidate_common_rank.m``.
+    Faithful translation of ``crossvalidate_common_rank.m`` except for
+    the order of min/mean in CV_min: the MATLAB (v2) computed
+    min_c(mean_folds(...)), which is systematically MORE LIBERAL than
+    the paper's mean_folds(min_c(...)) because min·mean ≥ mean·min.
+    Fixed to match the paper's equation.
 
     Key design decisions preserved:
     1. **Subject-level folds** — never split conditions within subject.
-    2. **CV_min = min over conditions** — strict criterion requiring
-       generalization to ALL conditions.
+    2. **CV_min = min over conditions within fold** — strict criterion
+    requiring generalization to ALL conditions.
     3. **Score normalization by r** — ||U_i^T W_r||_F² / r so that the
-       score is bounded by 1 and comparable across different r values.
+    score is bounded by 1 and comparable across different r values.
     4. **Separate RNG state**: MATLAB saves/restores ``rng`` state to
-       avoid polluting the caller's stream. Python's
-       ``np.random.default_rng(seed)`` creates an independent generator,
-       achieving the same isolation automatically.
+    avoid polluting the caller's stream. Python's
+    ``np.random.default_rng(seed)`` creates an independent generator,
+    achieving the same isolation automatically.
     """
     if opts is None:
         opts = {}
@@ -194,18 +235,23 @@ def crossvalidate_common_rank(
 
     mean_cv = np.nanmean(fold_score, axis=0)
 
+    # CV_min del paper: min sobre condiciones DENTRO de cada fold y
+    # luego promedio sobre folds (mean_folds(min_c)). El orden importa:
+    # min_c(mean_f) >= mean_f(min_c) — el anterior era mas liberal.
+    fold_min_condition = np.nanmin(condition_score, axis=1)  # (n_folds, nr)
+    cv_min = np.nanmean(fold_min_condition, axis=0)
+
     if C == 1:
         mean_condition = np.nanmean(condition_score, axis=0).reshape(1, -1)
     else:
         mean_condition = np.nanmean(condition_score, axis=0)
-
-    cv_min = np.nanmin(mean_condition, axis=0)
 
     return {
         "r_values": r_values,
         "fold_id": fold_id,
         "fold_score": fold_score,
         "condition_score": condition_score,
+        "fold_min_condition": fold_min_condition,
         "mean": mean_cv,
         "mean_condition": mean_condition,
         "min_condition": cv_min,
@@ -240,24 +286,47 @@ def cdhsa_A6_common_rank(
         'rank', 'S', 'C'.
     opts : dict, optional
         max_common (int, default min(20, len(R['lambda_'])))
+            Number of candidate common directions to test. Use the full
+            candidate set from A1-A5 (``max_common``) to avoid censoring
+            r0 at an arbitrary cap.
         n_folds (int, default 5)
         n_null (int, default 100)
         alpha (float, default 0.05)
         seed (int, default 1)
+        null_type : {'haar', 'hankel'} (default 'haar')
+            Null model for criterion (i)/(ii). 'haar' is the classical
+            random-subspace null; 'hankel' uses the channel-rotation null
+            of Section 7 of the paper (strictly more conservative). When
+            'hankel', the extra keys are required:
+            - 'X' : the same X cell passed to cdhsa_A1_A5 (first-level
+              Hankel matrices),
+            - 'L_hankel' : the same L (second-level depth),
+            - 'hankel_row_block' (int, default 0): rows of X per channel
+              group (first-level depth, channel-major layout). If > 0 the
+              rotation is block-diagonal I_L1 ⊗ Q with Q in channel space
+              (paper-faithful); if 0, a dense rotation of all X rows
+              (legacy).
+        col_masks : list of list of arrays or None
+            Máscaras de columnas de nivel 2 por grabación (ver
+            ``level2_boundary_mask``); se pasan al nulo 'hankel' para que
+            use la MISMA estructura de columnas que A1-A5. Con 'haar' no
+            tienen efecto (el nulo Haar no usa X).
 
     Returns
     -------
     A6 : dict with keys:
         r_values : ndarray (qmax,) — candidate ranks tested
-        cv : dict — output from crossvalidate_common_rank
-        null : dict — output from random_subspace_null
+        cv : dict — output from crossvalidate_common_rank (None if S < 2)
+        null : dict — output from random_subspace_null / hankel_preserving_null
         lambda_observed : ndarray (qmax,) — λ_j for j=1..qmax
         lambda_significant : ndarray (qmax,) bool — λ exceeds null quantile
         cv_significant : ndarray (qmax,) bool — CV_min exceeds null quantile
+            (all True when S < 2: criterion (ii) is vacuous without CV)
         pass : ndarray (qmax,) bool — BOTH criteria pass
         r0 : int — recommended common rank (0 if none pass)
         W0 : ndarray (d, r0) — fixed common basis columns 1..r0
         lambda0 : ndarray (r0,) — commonality of retained directions
+        single_subject : bool — True if the CV criterion was skipped (S < 2)
 
     CRITICAL ANALYSIS vs MATLAB
     ---------------------------
@@ -289,27 +358,62 @@ def cdhsa_A6_common_rank(
     n_null = opts.get("n_null", 100)
     alpha = opts.get("alpha", 0.05)
     seed = opts.get("seed", 1)
+    null_type = opts.get("null_type", "haar")
 
     qmax = min(max_common, len(R["lambda_"]), R["W"].shape[1])
     r_values = np.arange(1, qmax + 1, dtype=int)
 
     # (1) Cross-validation on OBSERVED data
-    cv_opts = {"n_folds": n_folds, "seed": seed}
-    cv = crossvalidate_common_rank(R["U"], r_values, cv_opts)
+    # (S < 2: subject-level CV is undefined -> criterion (ii) vacuous,
+    #  r0 follows criterion (i) alone; documented, per-replica pipelines)
+    S_data = R["S"]
+    single_subject = S_data < 2
+    if single_subject:
+        cv = None
+    else:
+        cv_opts = {"n_folds": n_folds, "seed": seed}
+        cv = crossvalidate_common_rank(R["U"], r_values, cv_opts)
 
-    # (2) Null distribution (random subspace null)
-    null_opts = {
-        "n_null": n_null,
-        "alpha": alpha,
-        "n_folds": n_folds,
-        "seed": seed + 10,
-    }
-    null = random_subspace_null(R["U"], r_values, null_opts)
+    # (2) Null distribution
+    if null_type == "hankel":
+        from src.cdhsa.null_distributions import hankel_preserving_null
+
+        X_data = opts.get("X")
+        L_hankel = opts.get("L_hankel")
+        if X_data is None or L_hankel is None:
+            raise ValueError(
+                "null_type='hankel' requires opts['X'] (first-level Hankel "
+                "cell, the same X passed to cdhsa_A1_A5) and "
+                "opts['L_hankel'] (the same L, second-level depth)."
+            )
+        null_opts = {
+            "n_null": n_null,
+            "alpha": alpha,
+            "n_folds": n_folds,
+            "seed": seed + 10,
+            "row_block": int(opts.get("hankel_row_block", 0)),
+            "col_masks": opts.get("col_masks"),
+        }
+        null = hankel_preserving_null(
+            X_data, L_hankel, R["U"], r_values, null_opts
+        )
+    else:
+        null_opts = {
+            "n_null": n_null,
+            "alpha": alpha,
+            "n_folds": n_folds,
+            "seed": seed + 10,
+        }
+        null = random_subspace_null(R["U"], r_values, null_opts)
 
     # (3) Compare observed vs null
     obs_lambda = R["lambda_"][:qmax]
     lambda_sig = obs_lambda > null["lambda_q"][:qmax]
-    cv_sig = cv["min_condition"] > null["cv_min_q"]
+    if single_subject or cv is None:
+        # Criterio (ii) vacuo sin CV: solo gobierna el criterio (i).
+        cv_sig = np.ones(qmax, dtype=bool)
+    else:
+        cv_sig = cv["min_condition"] > null["cv_min_q"]
     pass_both = lambda_sig & cv_sig
 
     # (4) Consecutive-prefix criterion
@@ -331,6 +435,7 @@ def cdhsa_A6_common_rank(
         "pass": pass_both,
         "r0": r0,
         "lambda0": R["lambda_"][:r0].copy() if r0 > 0 else np.array([]),
+        "single_subject": single_subject,
     }
 
     if r0 > 0:

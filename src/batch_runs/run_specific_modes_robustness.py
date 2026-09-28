@@ -4,12 +4,23 @@ run_specific_modes_robustness.py
 =================================
 Pipeline completo de robustez de modos especificos por tarea.
 
+NOTA (v4): este runner es un analisis EXPLORATORIO de robustez por
+super-sujeto (S=1 por corrida; CD-HSA se ejecuta en modo descriptivo:
+sin CV de A6 ni tests de permutacion, que requieren S >= 2). NO es el
+"Framework 2" del paper (consistencia >=4/5 por replica): esa analitica
+vive en ``src/cdhsa/replica_consistency.py`` y se activa en el pipeline
+principal con ``--run-replica-consistency`` (requiere el analisis
+pooled con S >= 2).
+
 Para cada super-sujeto:
   1. Construye matrices de Hankel para todas las tareas
   2. Corre el pipeline CD-HSA completo (Steps A, A6, B/C, Tangent, D)
+     en modo single-subject (S=1; v4: A6 sin criterio CV, B/C
+     descriptivo, tangente degenerado — antes crasheaba)
   3. Calcula la especificidad por modo por tarea a partir de la
      descomposicion de la covarianza pool (los L modos mas
-     energeticos en promedio)
+     energeticos en promedio) — criterio EXPLORATORIO propio de este
+     runner, distinto de la Def. 3.13/3.14 del paper
   4. Selecciona los top-k modos especificos por tarea
   5. Guarda resultados CD-HSA + especificidad
 
@@ -18,7 +29,7 @@ Despues de todos los super-sujetos:
      usando angulos principales + correlacion modo-a-modo
   7. Genera reporte de consistencia
 
-Metodo de especificidad:
+Metodo de especificidad (exploratorio):
   Para cada modo l del pool (eigenvectores de Sigma_pool):
     E(c,l) = u_l^T @ Sigma_c @ u_l    (energia del modo l en tarea c)
     S(l)   = u_l^T @ Sigma_pool @ u_l (energia promedio del modo l)
@@ -1009,6 +1020,8 @@ class SpecificModesRunner:
             tangent_n_perm=dp.get("tangent_n_perm", 2000),
             tangent_seed=dp.get("tangent_seed", 9999),
             tangent_alpha=dp.get("tangent_alpha", 0.05),
+            effective_rank=dp.get("effective_rank", False),
+            bc_rank_outcome=dp.get("rank_outcome", "selected"),
             d_max_specific=dp.get("d_max_specific", 10),
             d_residual_rank_method=dp.get(
                 "d_residual_rank_method", "local_gap"
@@ -1094,11 +1107,23 @@ class SpecificModesRunner:
         t_hankel = time.time() - t0_total
 
         # === 2. Correr CD-HSA ===
-        logger.info("  [2/4] Ejecutando CD-HSA...")
+        logger.info("  [2/4] Ejecutando CD-HSA (S=1, modo descriptivo)...")
         cdhsa_config = self._build_cdhsa_config()
+        # (v4) Mascara de fronteras de concatenacion, igual que el
+        # pipeline principal (paper: descartar ventanas que cruzan
+        # sujetos). Opt-out via cdhsa_params['no_boundary_mask'].
+        col_masks = None
+        if not dp.get("no_boundary_mask", False):
+            try:
+                from src.pipelines.run_cdhsa import _compute_col_masks
+                col_masks = _compute_col_masks(X, hankel_info, self.L)
+            except Exception as exc:
+                logger.warning("  [WARN] sin mascara de fronteras: %s", exc)
+                col_masks = None
         t_cdhsa = time.time()
         try:
-            cdhsa_result = run_cdhsa(X, self.L, cdhsa_config)
+            cdhsa_result = run_cdhsa(X, self.L, cdhsa_config,
+                                     col_masks=col_masks)
         except Exception as exc:
             logger.error("  ERROR CD-HSA: %s", exc)
             import traceback

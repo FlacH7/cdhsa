@@ -32,6 +32,10 @@ con las siguientes mejoras y correcciones identificadas:
    SVD izquierda es equivalente a eigendecompose M₀ = (1/N)Σ U_i U_i^T.
    El MATLAB lo hace bien. Aquí usamos np.linalg.svd en vez de svds porque
    B típicamente tiene dimensiones (pL, Σr_sc) donde Σr_sc << pL.
+   NOTA (v4): λ_j = σ_j(B) — VALOR SINGULAR, no su cuadrado — para ser
+   homogéneo con Step D (lambda_specific) y con la Def. 3.13 del paper.
+   El cambio es monótono, así que el criterio (i) de A6 no se altera;
+   solo cambian los valores REPORTADOS de λ.
 
 4. **Verificación de consistencia de canales**: Añadimos chequeo explícito
    de que todos los X[s][c] tengan el mismo número de canales p.
@@ -44,6 +48,16 @@ con las siguientes mejoras y correcciones identificadas:
    `scipy.sparse.linalg.LinearOperator` para que `svds` nunca necesite
    la matriz completa. Se añaden ``make_block_hankel_linop``,
    ``_make_scaled_linop``, y ``compute_block_hankel_fro``.
+
+7. **Máscara de fronteras de concatenación (v4)**: cuando un
+   super-sujeto es la concatenación temporal de varios sujetos, las
+   columnas de nivel 2 cuya ventana completa de muestras
+   [t, t+L+depth-2] cruza una frontera interna mezclan dinámicas de
+   individuos distintos. El paper promete descartarlas (a lo sumo
+   L+depth-2 columnas por frontera). ``level2_boundary_mask`` computa
+   la máscara y ``make_block_hankel_linop``/``compute_block_hankel_fro``
+   la aplican (columnas enmascaradas = columnas cero; equivalente
+   matemático a eliminarlas) sin materializar nada extra.
 
 Dependencias: numpy, scipy.sparse.linalg (solo para SVD truncada grande).
 """
@@ -125,10 +139,108 @@ def build_block_hankel(X: NDArray[np.floating], L: int) -> NDArray[np.floating]:
 
 
 # ============================================================================
+# 0c. Boundary masking for concatenated super-subjects (v4)
+# ============================================================================
+
+def level2_boundary_mask(
+    member_n_times: list[int] | NDArray[np.integer],
+    depth: int,
+    L: int,
+) -> NDArray[np.bool_]:
+    """
+    Máscara de columnas de nivel 2 libres de mezcla entre sujetos.
+
+    Un super-sujeto es la concatenación temporal de varios sujetos.
+    X[s][c] es su Hankel de nivel 1 (profundidad ``depth``), de modo que
+    la columna t de la matriz de nivel 2 (construida con
+    ``build_block_hankel(X, L)``) cubre las muestras
+    [t, t + L + depth - 2] del flujo concatenado. Esa columna mezcla
+    dinámicas de dos sujetos distintos si y solo si su ventana cruza
+    una frontera interna de concatenación.
+
+    El paper (Sección de construcción de datos) promete descartar esas
+    columnas: a lo sumo ``L + depth - 2`` columnas por frontera interna.
+    Esta función devuelve la máscara booleana (True = columna limpia) de
+    longitud ``K2 = T_total - (depth-1) - (L-1)``.
+
+    Parameters
+    ----------
+    member_n_times : list of int
+        Número de muestras (ya recortadas y filtradas) de CADA sujeto
+        miembro, en orden de concatenación. Un solo miembro => sin
+        fronteras internas => máscara toda True.
+    depth : int
+        Profundidad del embedding de nivel 1 (filas de X = canales*depth).
+    L : int
+        Profundidad del embedding de nivel 2.
+
+    Returns
+    -------
+    mask : ndarray of bool, shape (K2,)
+        True para las columnas cuya ventana completa de muestras no
+        cruza ninguna frontera interna.
+    """
+    member_n_times = np.asarray(member_n_times, dtype=np.int64).ravel()
+    if member_n_times.size == 0:
+        raise ValueError("member_n_times está vacío.")
+    if np.any(member_n_times <= 0):
+        raise ValueError("member_n_times debe ser > 0 para cada miembro.")
+    if depth < 1 or L < 1:
+        raise ValueError(f"depth y L deben ser >= 1, got depth={depth}, L={L}")
+
+    T_total = int(member_n_times.sum())
+    K2 = T_total - (depth - 1) - (L - 1)
+    if K2 < 1:
+        raise ValueError(
+            f"Grabación demasiado corta para el embedding de dos niveles: "
+            f"T={T_total}, depth={depth}, L={L} => K2={K2} < 1."
+        )
+
+    # Fronteras internas: primera muestra de cada miembro excepto el primero.
+    boundaries = np.cumsum(member_n_times)[:-1]
+
+    mask = np.ones(K2, dtype=bool)
+    t = np.arange(K2)
+    # La columna t cruza la frontera b si t < b <= t + (L + depth - 2).
+    for b in boundaries:
+        crossing = (t < b) & (t + L + depth - 2 >= b)
+        mask &= ~crossing
+    return mask
+
+
+def _bad_level2_columns(
+    col_mask: NDArray[np.bool_] | None,
+    K: int,
+) -> NDArray[np.integer] | None:
+    """Índices de columnas enmascaradas, o None si no hay enmascaramiento.
+
+    Valida la longitud de la máscara contra ``K`` (número de columnas de
+    la matriz de nivel 2). Devuelve un array vacío si la máscara es toda
+    True (equivalente a no enmascarar; los caminos rápidos lo detectan
+    con ``bad is None or bad.size == 0``).
+    """
+    if col_mask is None:
+        return None
+    m = np.asarray(col_mask).astype(bool).ravel()
+    if m.shape[0] != K:
+        raise ValueError(
+            f"col_mask tiene longitud {m.shape[0]} pero la matriz de "
+            f"nivel 2 tiene {K} columnas. ¿La máscara se calculó con el "
+            f"mismo depth/L de esta grabación?"
+        )
+    bad = np.flatnonzero(~m)
+    return bad if bad.size > 0 else None
+
+
+# ============================================================================
 # 0b. Memory-efficient block-Hankel helpers (v2)
 # ============================================================================
 
-def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOperator:
+def make_block_hankel_linop(
+    X: NDArray[np.floating],
+    L: int,
+    col_mask: NDArray[np.bool_] | None = None,
+) -> ScipyLinearOperator:
     """
     Create a LinearOperator that computes build_block_hankel(X, L) @ v
     and build_block_hankel(X, L).T @ w WITHOUT materializing the matrix.
@@ -146,6 +258,14 @@ def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOpera
         Datos EEG canales × tiempo.
     L : int
         Número de retardos (embedding depth).
+    col_mask : ndarray of bool, shape (K,), optional
+        Máscara de columnas de nivel 2 (ver ``level2_boundary_mask``).
+        Las columnas con False se tratan como CEROS: la acción del
+        operador es exactamente la de ``build_block_hankel(X, L)`` con
+        esas columnas eliminadas (las columnas cero no afectan a la SVD
+        izquierda, a la norma Frobenius ni a H^T @ W). Solo se
+        materializan las pocas columnas enmascaradas (d × n_bad), así
+        que el coste extra es despreciable.
 
     Returns
     -------
@@ -163,7 +283,17 @@ def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOpera
     K = T - L + 1
     d = p * L
 
-    def matvec(v):
+    bad = _bad_level2_columns(col_mask, K)
+
+    # Columnas enmascaradas de H (d, n_bad), materializadas UNA sola vez.
+    Hbad: NDArray[np.floating] | None = None
+    if bad is not None:
+        Hbad = np.empty((d, bad.size), dtype=np.float64)
+        for ell in range(L):
+            # Columna t de H: bloque de fila ell = X[:, t + L - 1 - ell].
+            Hbad[ell * p : (ell + 1) * p, :] = X[:, bad + (L - 1 - ell)]
+
+    def matvec_full(v):
         v = np.asarray(v).ravel()
         out = np.zeros(d, dtype=np.float64)
         for ell in range(L):
@@ -171,7 +301,7 @@ def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOpera
             out[ell * p : (ell + 1) * p] = block @ v
         return out
 
-    def rmatvec(w):
+    def rmatvec_full(w):
         w = np.asarray(w).ravel()
         out = np.zeros(K, dtype=np.float64)
         for ell in range(L):
@@ -179,11 +309,11 @@ def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOpera
             out += block.T @ w[ell * p : (ell + 1) * p]
         return out
 
-    def _matmat(V):
+    def _matmat_full(V):
         """H @ V for V of shape (K, nvec) -> (d, nvec)."""
         V = np.asarray(V)
         if V.ndim == 1:
-            return matvec(V)
+            return matvec_full(V)
         nvec = V.shape[1]
         out = np.zeros((d, nvec), dtype=np.float64)
         for ell in range(L):
@@ -191,17 +321,52 @@ def make_block_hankel_linop(X: NDArray[np.floating], L: int) -> ScipyLinearOpera
             out[ell * p : (ell + 1) * p, :] = block @ V  # (p, nvec)
         return out
 
-    def _rmatmat(W):
+    def _rmatmat_full(W):
         """H.T @ W for W of shape (d, nvec) -> (K, nvec)."""
         W = np.asarray(W)
         if W.ndim == 1:
-            return rmatvec(W)
+            return rmatvec_full(W)
         nvec = W.shape[1]
         out = np.zeros((K, nvec), dtype=np.float64)
         for ell in range(L):
             block = X[:, L - 1 - ell : T - ell]  # (p, K)
             out += block.T @ W[ell * p : (ell + 1) * p, :]  # (K, nvec)
         return out
+
+    if Hbad is None:
+        matvec, rmatvec, _matmat, _rmatmat = (
+            matvec_full, rmatvec_full, _matmat_full, _rmatmat_full,
+        )
+    else:
+        bad_idx = bad  # cierre explícito
+
+        def matvec(v):
+            # H_masked @ v = H @ v - H[:, bad] @ v[bad]
+            out = matvec_full(v)
+            out -= Hbad @ (np.asarray(v).ravel()[bad_idx])
+            return out
+
+        def rmatvec(w):
+            # H_masked.T @ w = mask * (H.T @ w)
+            out = rmatvec_full(w)
+            out[bad_idx] = 0.0
+            return out
+
+        def _matmat(V):
+            V = np.asarray(V)
+            if V.ndim == 1:
+                return matvec(V)
+            out = _matmat_full(V)
+            out -= Hbad @ V[bad_idx, :]
+            return out
+
+        def _rmatmat(W):
+            W = np.asarray(W)
+            if W.ndim == 1:
+                return rmatvec(W)
+            out = _rmatmat_full(W)
+            out[bad_idx, :] = 0.0
+            return out
 
     linop = ScipyLinearOperator((d, K), matvec=matvec, rmatvec=rmatvec, dtype=np.float64)
     linop._matmat = _matmat
@@ -245,7 +410,11 @@ def _make_scaled_linop(linop: ScipyLinearOperator, scale: float) -> ScipyLinearO
     return scaled
 
 
-def compute_block_hankel_fro(X: NDArray[np.floating], L: int) -> float:
+def compute_block_hankel_fro(
+    X: NDArray[np.floating],
+    L: int,
+    col_mask: NDArray[np.bool_] | None = None,
+) -> float:
     """
     Compute ||build_block_hankel(X, L)||_F without materializing the matrix.
 
@@ -253,17 +422,24 @@ def compute_block_hankel_fro(X: NDArray[np.floating], L: int) -> float:
     Each block is a VIEW into X, so peak memory = O(p * K) for the dot product.
     Uses np.dot(block.ravel(), block.ravel()) to avoid creating block**2 temporary.
 
+    With ``col_mask`` (ver ``level2_boundary_mask``), the norm is that of
+    the matrix with the masked columns REMOVED: se resta la energía de
+    las pocas columnas enmascaradas (coste O((n_bad + L) * p)).
+
     Parameters
     ----------
     X : array, shape (p, T)
         Datos EEG canales × tiempo.
     L : int
         Número de retardos (embedding depth).
+    col_mask : ndarray of bool, shape (T - L + 1,), optional
+        Máscara de columnas de nivel 2.
 
     Returns
     -------
     hnorm : float
-        Norma Frobenius de la matriz block-Hankel.
+        Norma Frobenius de la matriz block-Hankel (con columnas
+        enmascaradas eliminadas si se provee ``col_mask``).
     """
     X = np.asarray(X, dtype=np.float64)
     if X.ndim != 2:
@@ -277,7 +453,20 @@ def compute_block_hankel_fro(X: NDArray[np.floating], L: int) -> float:
     for ell in range(L):
         block = X[:, L - 1 - ell : T - ell]
         fro_sq += np.dot(block.ravel(), block.ravel())
-    return np.sqrt(fro_sq)
+
+    bad = _bad_level2_columns(col_mask, T - L + 1)
+    if bad is not None:
+        # ||H[:, t]||^2 = sum_ell ||X[:, t + L - 1 - ell]||^2
+        # (suma de normas de L columnas individuales de X).
+        # Solo se tocan las columnas de X implicadas (rango contiguo pequeño).
+        lo = max(int(bad.min()) - 1, 0)
+        hi = min(int(bad.max()) + L, T)
+        seg = X[:, lo:hi]
+        cn2 = np.einsum("ij,ij->j", seg, seg)  # (hi-lo,)
+        idx = (bad[:, None] + (L - 1) - np.arange(L)[None, :]) - lo
+        fro_sq -= float(cn2[idx].sum())
+
+    return np.sqrt(max(fro_sq, 0.0))
 
 
 # ============================================================================
@@ -408,6 +597,94 @@ def truncated_left_svd_with_values(
 
     U_full, s_full, _ = np.linalg.svd(H, full_matrices=False)
     return U_full[:, :r], s_full[:r]
+
+
+def select_rank_variance(
+    H: Union[NDArray[np.floating], ScipyLinearOperator],
+    var_explained: float = 0.99,
+    var_max_rank: int = 50,
+    var_min_rank: int = 1,
+) -> tuple[NDArray[np.floating], int, NDArray[np.floating], NDArray[np.floating], bool]:
+    """
+    Selección de rango local por varianza explicada (criterio X%).
+
+    Selecciona el rango ``r`` como el menor número de componentes que
+    explican una fracción ``var_explained`` de la energía total de la
+    matriz (Hankel) de referencia::
+
+        r = min{ r' : sum_{i<=r'} s_i^2 / ||H||_F^2 >= var_explained }
+
+    La matriz ``H`` debe estar normalizada por su norma Frobenius
+    (p.ej. vía ``_make_scaled_linop``), de modo que la energía total es
+    exactamente 1 y ``cumsum(s_i^2)`` es la fracción de varianza
+    explicada acumulada.
+
+    Parameters
+    ----------
+    H : array (m, n) o ScipyLinearOperator
+        Matriz (u operador) YA normalizada por ||H||_F.
+    var_explained : float
+        Fracción de varianza a explicar (0, 1]. P.ej. 0.99 para X=99%.
+    var_max_rank : int
+        Tope de candidatos a examinar. Si la varianza objetivo no se
+        alcanza dentro de este tope, se retorna el tope y
+        ``censored=True`` (el rango quedó censurado por el cap).
+    var_min_rank : int
+        Rango mínimo a retornar (piso).
+
+    Returns
+    -------
+    U : array, shape (m, r)
+        Primeros r vectores singulares izquierdos (descendente).
+    r : int
+        Rango seleccionado.
+    s_vals : array, shape (k,)
+        Valores singulares computados (descendente), k <= var_max_rank.
+    cum_var : array, shape (k,)
+        Varianza explicada acumulada (fracción de ||H||_F^2).
+    censored : bool
+        True si var_explained no se alcanzó con var_max_rank componentes.
+
+    Notes
+    -----
+    Este método reviva el test de rango del Step B (Remark 3.6 del paper):
+    con ``rank_method='fixed'`` los rangos locales son constantes y el
+    test es degenerado; con criterio de varianza cada grabación tiene su
+    propio r(s,c) y el test recupera su significado como sonda de
+    dimensionalidad dependiente de condición.
+
+    Coste: un único ``svds`` con k = var_max_rank candidatos (líneal en
+    el tope, no se re-ejecuta el SVD por candidato).
+    """
+    m, n = H.shape
+    k = int(min(var_max_rank, m - 1, n - 1))
+    if k < 1:
+        raise ValueError(
+            f"var_max_rank demasiado pequeño para H de shape {H.shape}"
+        )
+    if not (0.0 < var_explained <= 1.0):
+        raise ValueError(
+            f"var_explained debe estar en (0, 1], got {var_explained}"
+        )
+
+    U_k, s_vals = truncated_left_svd_with_values(H, k)
+
+    # H está normalizada: energia total = ||H||_F^2 / ||H||_F^2 = 1
+    cum_var = np.cumsum(np.clip(s_vals ** 2, 0.0, None))
+    cum_var = np.minimum(cum_var, 1.0)
+
+    hits = np.flatnonzero(cum_var >= var_explained - 1e-12)
+    if len(hits) > 0:
+        r = int(hits[0]) + 1
+        censored = False
+    else:
+        r = k
+        censored = True
+
+    r = max(r, int(var_min_rank))
+    r = min(r, k)
+
+    return U_k[:, :r], r, s_vals, cum_var, censored
 
 
 # ============================================================================
@@ -559,6 +836,37 @@ def select_rank_reproducibility(
     return r_selected, R
 
 
+def _effective_rank_from_spectrum(
+    s_vals: NDArray[np.floating],
+    var_explained: float,
+    r_min: int = 1,
+) -> tuple[int, bool]:
+    """
+    Rango efectivo de un espectro de valores singulares (criterio X%).
+
+    r = min{ r' : sum_{i<=r'} s_i^2 / sum_i s_i^2 >= var_explained }
+
+    Igual que el criterio de ``select_rank_variance`` pero sobre un
+    espectro ya computado (usado por el estimador de rango efectivo de
+    ``cdhsa_A1_A5`` cuando ``effective_rank=True``).
+
+    Returns
+    -------
+    (r, censored) : (int, bool)
+        censored=True si var_explained no se alcanza con el espectro
+        disponible (r queda en la longitud del espectro).
+    """
+    s2 = np.clip(np.asarray(s_vals, dtype=np.float64) ** 2, 0.0, None)
+    total = float(s2.sum())
+    if total <= 0.0 or s2.size == 0:
+        return max(1, int(r_min)), False
+    cum = np.cumsum(s2) / total
+    hits = np.flatnonzero(cum >= var_explained - 1e-12)
+    if len(hits) > 0:
+        return max(int(hits[0]) + 1, int(r_min)), False
+    return max(int(s2.size), int(r_min)), True
+
+
 # ============================================================================
 # 3. Main: Steps A1-A5
 # ============================================================================
@@ -567,7 +875,7 @@ def cdhsa_A1_A5(
     X: list[list[NDArray[np.floating]]],
     L: int,
     *,
-    rank_method: Literal["fixed", "reproducibility"] = "fixed",
+    rank_method: Literal["fixed", "reproducibility", "variance"] = "fixed",
     fixed_rank: int = 10,
     rmax: int = 20,
     n_blocks: int = 4,
@@ -575,6 +883,11 @@ def cdhsa_A1_A5(
     repro_strategy: Literal["consecutive", "gap"] = "consecutive",
     max_common: int = 30,
     prevalence_quantile: float = 0.10,
+    var_explained: float = 0.99,
+    var_max_rank: int = 50,
+    var_min_rank: int = 1,
+    col_masks: list | None = None,
+    effective_rank: bool = False,
 ) -> dict:
     """
     CD-HSA Steps A1-A5: estimación del subespacio Hankel común poblacional.
@@ -584,10 +897,14 @@ def cdhsa_A1_A5(
     **A2**: Estimar el rank de señal confiable de cada grabación.
       - 'fixed': usar ``fixed_rank`` directamente.
       - 'reproducibilidad': reproducibilidad entre bloques temporales.
+      - 'variance': menor r que explica ``var_explained`` de la energía
+        de la Hankel embebida (criterio X%), por grabación.
 
     **A3**: Estimar el subespacio común poblacional vía SVD de la
       concatenación de bases locales B = [U₁ ... U_N] / √N.
-      Los autovalores λ_j = σ_j²(B) miden la commonalidad de cada dirección.
+      Los valores λ_j = σ_j(B) (VALORES SINGULARES, no su cuadrado;
+      homogéneo con Step D y Def. 3.13 del paper) miden la commonalidad
+      de cada dirección.
 
     **A4**: Calcular la matriz de alineación a_{sc,j} = ||U_sc^T w_j||²,
       que cuantifica cuánto de cada dirección común está presente en
@@ -603,9 +920,25 @@ def cdhsa_A1_A5(
         condición c. Canales en filas, tiempo en columnas.
     L : int
         Número de retardos Hankel (embedding depth).
-    rank_method : {'fixed', 'reproducibility'}
+    rank_method : {'fixed', 'reproducibility', 'variance'}
+        'fixed': usar ``fixed_rank`` directamente (r constante -> el test
+        de rango del Step B es degenerado, Remark 3.6 del paper).
+        'reproducibility': reproducibilidad entre bloques temporales.
+        'variance': menor r que explica ``var_explained`` de la energía
+        de la Hankel embebida (criterio X%), por grabación — ver
+        ``select_rank_variance``.
     fixed_rank : int
         Rank local fijo cuando ``rank_method='fixed'``.
+    var_explained : float
+        Fracción de varianza a explicar cuando ``rank_method='variance'``
+        (p.ej. 0.99 para X=99%). También se usa como criterio del
+        estimador de rango efectivo cuando ``effective_rank=True``.
+    var_max_rank : int
+        Tope de candidatos cuando ``rank_method='variance'`` (y del
+        espectro del estimador efectivo).
+    var_min_rank : int
+        Piso de rango cuando ``rank_method='variance'`` (y mínimo del
+        estimador efectivo).
     rmax : int
         Máximo rank candidato para reproducibilidad.
     n_blocks : int
@@ -618,6 +951,20 @@ def cdhsa_A1_A5(
         Máximo número de direcciones comunes a estimar.
     prevalence_quantile : float
         Percentil inferior para la medida de prevalencia.
+    col_masks : list of list of arrays or None
+        col_masks[s][c] es una máscara booleana de longitud
+        ``T_sc - L + 1`` (columnas de nivel 2) o None. Las columnas
+        False se excluyen de TODO el cálculo de esa grabación (SVD,
+        normas, energía) — ver ``level2_boundary_mask``. None = sin
+        enmascaramiento (comportamiento v3).
+    effective_rank : bool
+        Si True, calcula ADEMÁS del rango primario un rango efectivo
+        por grabación con el criterio X% sobre el espectro de la misma
+        Hankel normalizada (un único ``svds`` extra por grabación
+        cuando rank_method != 'variance'; gratis cuando = 'variance').
+        Se almacena en R['rank_effective'] y permite que el test de
+        rango del Step B diga algo incluso con rank_method='fixed'
+        (Remark 3.6): es el "estimador de dimensionalidad efectiva".
 
     Returns
     -------
@@ -626,14 +973,19 @@ def cdhsa_A1_A5(
             U[s][c] shape (p*L, r_sc) — base local Hankel ortonormal.
         rank : ndarray, shape (S, C)
             Rank local seleccionado para cada grabación.
+        rank_effective : ndarray, shape (S, C)
+            Rango efectivo X% — SOLO presente cuando
+            ``effective_rank=True`` (junto con 'rank_effective_censored'
+            y 'svals'); si no, la clave no existe.
         hankel_norm : ndarray, shape (S, C)
-            ||H_sc||_F original (antes de normalización).
+            ||H_sc||_F original (antes de normalización; con
+            enmascaramiento, de las columnas válidas).
         repro_curve : list of list of arrays or None
             Curvas de reproducibilidad (solo si rank_method='reproducibility').
         W : ndarray, shape (p*L, q)
             Direcciones comunes poblacionales (columnas ortonormales).
         lambda_ : ndarray, shape (q,)
-            Autovalores de commonalidad λ_j ∈ [0, 1].
+            λ_j = σ_j(B) ∈ [0, 1] (valores singulares de B).
         alignment : ndarray, shape (S*C, q)
             a_{sc,j} = ||U_sc^T w_j||² para cada grabación y dirección.
         sc_index : ndarray, shape (S*C, 2)
@@ -642,10 +994,25 @@ def cdhsa_A1_A5(
         median_alignment : ndarray, shape (q,)
         prevalence : ndarray, shape (q,)
         min_alignment : ndarray, shape (q,)
+        col_masks : list of list of arrays or None
+            La máscara usada por grabación (None si no se enmascaró).
+        boundary_dropped : ndarray, shape (S, C)
+            Número de columnas de nivel 2 excluidas por la máscara
+            (0 si no hay máscara).
         S : int, C : int, p : int, d : int
             Dimensiones del problema.
         L_used : int
             L tal cual se pasó.
+
+    Notes
+    -----
+    El enmascaramiento de fronteras (``col_masks``) es equivalente a
+    eliminar las columnas de nivel 2 que cruzan fronteras de
+    concatenación antes de cualquier cálculo: las columnas enmascaradas
+    son tratadas como cero y no contribuyen ni a la SVD ni a las normas.
+    Con ``rank_method='reproducibility'`` el enmascaramiento no está
+    soportado (los bloques temporales internos del método no respetan
+    las fronteras) y se lanza NotImplementedError.
 
     CRÍTICA GLOBAL vs MATLAB
     ------------------------
@@ -683,17 +1050,55 @@ def cdhsa_A1_A5(
                     f"demasiado corto para L={L} (necesita >= {L + 2})"
                 )
 
+    # Validar col_masks y conflicto con 'reproducibility'
+    if col_masks is not None:
+        if len(col_masks) != S or any(len(row) != C for row in col_masks):
+            raise ValueError(
+                f"col_masks debe tener la forma (S={S}, C={C}) "
+                f"(lista de listas de máscaras o None)."
+            )
+        if rank_method == "reproducibility":
+            raise NotImplementedError(
+                "El enmascaramiento de fronteras no está soportado con "
+                "rank_method='reproducibility' (sus bloques temporales "
+                "internos cruzan las fronteras de concatenación). Use "
+                "rank_method='fixed' o 'variance' con super-sujetos."
+            )
+
     # ---- A1-A2: Hankel + normalización + rank local ----
     U_all: list[list[NDArray]] = [[None] * C for _ in range(S)]
     ranks = np.zeros((S, C), dtype=int)
     hankel_norms = np.zeros((S, C), dtype=np.float64)
     repro_curves: list[list[NDArray | None]] = [[None] * C for _ in range(S)]
+    var_curves: list[list[NDArray | None]] = [[None] * C for _ in range(S)]
+    var_achieved = np.full((S, C), np.nan, dtype=np.float64)
+    var_censored = np.zeros((S, C), dtype=bool)
+    boundary_dropped = np.zeros((S, C), dtype=int)
+    rank_effective = np.zeros((S, C), dtype=int) if effective_rank else None
+    eff_censored = np.zeros((S, C), dtype=bool) if effective_rank else None
+    svals_cell: list[list[NDArray | None]] = (
+        [[None] * C for _ in range(S)] if effective_rank else None
+    )
 
     for s in range(S):
         for c in range(C):
             Xi = np.asarray(X[s][c], dtype=np.float64)
+            mask_sc = None
+            if col_masks is not None and col_masks[s][c] is not None:
+                mask_sc = np.asarray(col_masks[s][c])
+                if mask_sc.shape[0] != Xi.shape[1] - L + 1:
+                    raise ValueError(
+                        f"col_masks[{s}][{c}] tiene longitud {mask_sc.shape[0]} "
+                        f"pero la matriz de nivel 2 de X[{s}][{c}] tiene "
+                        f"{Xi.shape[1] - L + 1} columnas."
+                    )
+                boundary_dropped[s, c] = int(
+                    np.sum(~mask_sc.astype(bool))
+                )
+
             # v2: compute Frobenius norm without materializing H
-            hnorm = compute_block_hankel_fro(Xi, L)
+            # (v4: de las columnas válidas si hay máscara de fronteras)
+            hnorm = compute_block_hankel_fro(Xi, L, col_mask=mask_sc)
             if hnorm <= np.finfo(np.float64).eps:
                 raise ValueError(
                     f"Hankel casi cero en sujeto {s}, condición {c}"
@@ -702,7 +1107,7 @@ def cdhsa_A1_A5(
 
             # A1: normalización geométrica via LinearOperator (no cambia U_sc, pero la
             # guardamos para B/C que necesita la escala original)
-            linop = make_block_hankel_linop(Xi, L)
+            linop = make_block_hankel_linop(Xi, L, col_mask=mask_sc)
             linop_norm = _make_scaled_linop(linop, hnorm)
 
             # A2: rank local
@@ -719,15 +1124,66 @@ def cdhsa_A1_A5(
                     threshold=repro_threshold,
                     strategy=repro_strategy,
                 )
+            elif rank_method == "variance":
+                Ui_var, r, s_vals_sc, cum_var_sc, censored_sc = select_rank_variance(
+                    linop_norm,
+                    var_explained=var_explained,
+                    var_max_rank=var_max_rank,
+                    var_min_rank=var_min_rank,
+                )
+                var_curves[s][c] = cum_var_sc
+                var_achieved[s, c] = float(cum_var_sc[r - 1]) if r >= 1 else np.nan
+                var_censored[s, c] = bool(censored_sc)
+                if censored_sc:
+                    import warnings
+                    warnings.warn(
+                        f"rank_method='variance': var_explained={var_explained} "
+                        f"no alcanzada con var_max_rank={var_max_rank} candidatos "
+                        f"en (s={s}, c={c}); r censurado en {r} "
+                        f"(var lograda={cum_var_sc[-1]:.4f})",
+                        stacklevel=2,
+                    )
+                repro = None
+                # Ui ya computada por select_rank_variance
+                Ui = Ui_var
+                U_all[s][c] = Ui
+                ranks[s, c] = r
+                if effective_rank:
+                    # Con 'variance' el rango seleccionado YA es el efectivo X%.
+                    rank_effective[s, c] = r
+                    eff_censored[s, c] = bool(censored_sc)
+                    svals_cell[s][c] = s_vals_sc
+                continue
             else:
                 raise ValueError(
-                    f"rank_method debe ser 'fixed' o 'reproducibility', got '{rank_method}'"
+                    f"rank_method debe ser 'fixed', 'reproducibility' o "
+                    f"'variance', got '{rank_method}'"
                 )
 
             Ui = truncated_left_svd(linop_norm, r)
             U_all[s][c] = Ui
             ranks[s, c] = r
             repro_curves[s][c] = repro
+
+            # Rango efectivo (estimador de dimensionalidad, Remark 3.6):
+            # un único svds extra sobre la MISMA Hankel normalizada.
+            if effective_rank:
+                m_op, n_op = linop_norm.shape
+                k_probe = int(min(max(var_max_rank, r), m_op - 1, n_op - 1))
+                if k_probe >= 1:
+                    _, s_probe = truncated_left_svd_with_values(
+                        linop_norm, k_probe
+                    )
+                    svals_cell[s][c] = s_probe
+                    r_eff, cen_eff = _effective_rank_from_spectrum(
+                        s_probe, var_explained, r_min=var_min_rank
+                    )
+                    rank_effective[s, c] = int(r_eff)
+                    eff_censored[s, c] = bool(cen_eff)
+                else:
+                    rank_effective[s, c] = int(r)
+                    eff_censored[s, c] = False
+                    svals_cell[s][c] = np.array([])
 
     # ---- A3: subespacio común poblacional ----
     # M₀ = (1/N) Σ U_sc U_sc^T
@@ -740,8 +1196,11 @@ def cdhsa_A1_A5(
 
     qmax = min(max_common, B.shape[0], B.shape[1])
     W, sigma_B = truncated_left_svd_with_values(B, qmax)
-    lambda_ = sigma_B ** 2
-    lambda_ = np.clip(lambda_, 0.0, 1.0)  # clipping numérico
+    # v4: λ_j = σ_j(B) — VALOR SINGULAR (homogéneo con Step D / Def. 3.13
+    # del paper; antes era σ², lo que hacía λ inconsistente entre A y D).
+    # σ_j(B) ≤ 1 siempre (B tiene columnas ortonormales / √N), y como el
+    # cambio es monótono el criterio (i) de A6 no se altera.
+    lambda_ = np.clip(sigma_B, 0.0, 1.0)  # clipping numérico
 
     # ---- A4: alineación por grabación ----
     alignment = np.zeros((N, qmax), dtype=np.float64)
@@ -761,11 +1220,18 @@ def cdhsa_A1_A5(
     prevalence = np.quantile(alignment, prevalence_quantile, axis=0)
     min_alignment = np.min(alignment, axis=0)
 
-    return {
+    result = {
         "U": U_all,
         "rank": ranks,
         "hankel_norm": hankel_norms,
         "repro_curve": repro_curves,
+        "rank_method": rank_method,
+        "var_explained": var_explained if rank_method == "variance" else None,
+        "var_curve": var_curves,
+        "var_explained_achieved": var_achieved,
+        "var_censored": var_censored,
+        "col_masks": col_masks,
+        "boundary_dropped": boundary_dropped,
         "W": W,
         "lambda_": lambda_,
         "alignment": alignment,
@@ -781,3 +1247,9 @@ def cdhsa_A1_A5(
         "L_used": L,
         "N": N,
     }
+    if effective_rank:
+        result["effective_rank"] = True
+        result["rank_effective"] = rank_effective
+        result["rank_effective_censored"] = eff_censored
+        result["svals"] = svals_cell
+    return result

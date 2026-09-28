@@ -505,7 +505,7 @@ def run_cdhsa_ludovico_core(
         print(f"  Modo              : single-subject (S=1)")
         print(f"  S (matrices)      : {S}")
         print(f"  C (condiciones)   : {C}")
-        print(f"  L (subespacio)    : {L}")
+        print(f"  L (embedding niv 2): {L}")
         print(f"  fixed_rank        : {config.fixed_rank}")
         print(f"  d_max_specific    : {config.d_max_specific}")
         print(f"  A6                : BYPASSED (fixed r0, no CV)")

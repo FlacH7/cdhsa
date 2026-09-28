@@ -2,7 +2,7 @@
 
 ## Descripción General
 
-El pipeline CD-HSA (*Common Directions — Hierarchical Subspace Analysis*) analiza la estructura de subespacios comunes y específicos por condición en datos EEG agrupados. Consta de dos componentes principales:
+El pipeline CD-HSA (*Correlated Directions Hankel Subspace Analysis*, nombre definitivo del paper; antes "Common Directions — Hierarchical Subspace Analysis") analiza la estructura de subespacios comunes y específicos por condición en datos EEG agrupados. Consta de dos componentes principales:
 
 | Componente | Archivo | Rol |
 |---|---|---|
@@ -742,6 +742,9 @@ El paso que consume más memoria es el **Step A** de CD-HSA, que internamente co
 |---|---|---|
 | `--n-super-subjects 3` | Block-Hankel de 1 SS (CD-HSA los procesa secuencialmente internamente) + las Hankel de los 3 SS en RAM para la intersección de canales | Más memoria en el preprocesamiento (2-pass), pero una sola ejecución. |
 | Batch runner (3 jobs × S=1) | Block-Hankel de 1 SS por job | Menos memoria por ejecución, pero 3 ejecuciones independientes. Resultados comparables pero no idénticos (cada SS se analiza individualmente). |
+
+---
+*AI生成*
 
 ---
 *AI生成*

@@ -381,7 +381,8 @@ def load_super_subject_eeg(
     t_stop: float | None = None,
     preload: bool = False,
     verbose: bool | str | None = None,
-) -> mne.io.Raw:
+    return_member_lengths: bool = False,
+) -> mne.io.Raw | tuple[mne.io.Raw, list[int]]:
     """
     Load and concatenate the EEG recordings of all individual subjects
     composing a super-subject.
@@ -423,11 +424,18 @@ def load_super_subject_eeg(
         Forwarded to :func:`load_test_retest_gedai_eeg_from_ids`.
     verbose : bool | str | None
         Verbosity level.
+    return_member_lengths : bool, default False
+        If True, also return the list of per-member sample counts
+        (``n_times`` of each individual raw, AFTER cropping), which the
+        CD-HSA pipeline uses to mask the level-2 Hankel columns that
+        cross concatenation boundaries (paper promise; see
+        ``a_common_subspace.level2_boundary_mask``).
 
     Returns
     -------
     raw_concat : mne.io.Raw
-        Concatenated raw object.
+        Concatenated raw object (or ``(raw_concat, member_lengths)``
+        when ``return_member_lengths=True``).
 
     Raises
     ------
@@ -512,6 +520,10 @@ def load_super_subject_eeg(
     if verbose:
         print(f"  [SuperSubject] Concatenating {len(raws)} raws along time axis...")
     _concat_t0 = time.time()
+    # Longitudes de los miembros (en muestras, ya recortadas) ANTES de
+    # concatenar: el pipeline CD-HSA las necesita para enmascarar las
+    # columnas de nivel 2 que cruzan fronteras entre sujetos.
+    member_lengths = [int(r.n_times) for r in raws]
     raw_concat = mne.concatenate_raws(raws)
     if verbose:
         print(f"  [SuperSubject] Concatenation done in {time.time() - _concat_t0:.1f}s")
@@ -522,4 +534,6 @@ def load_super_subject_eeg(
               f"{len(raw_concat.ch_names)} channels, "
               f"{total_dur:.1f} s ({total_dur / 60:.1f} min)")
 
+    if return_member_lengths:
+        return raw_concat, member_lengths
     return raw_concat
