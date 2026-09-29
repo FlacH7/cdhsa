@@ -11,6 +11,7 @@ results/
 constants/
 params/
 logs/
+patchs/
 
 # Distribution / packaging
 .Python

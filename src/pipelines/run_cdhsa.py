@@ -164,7 +164,8 @@ class CDHSAResult:
             rk_sum = self.BC.get('summary', {})
             if 'rank_F' in rk_sum:
                 deg = rk_sum.get('rank_degenerate')
-                note = (" (degenerate: fixed-rank config, Remark 3.6)"
+                note = (" (degenerate: rango constante entre grabaciones "
+                        "(fixed o censurado en el tope), Remark 3.6)"
                         if deg else "")
                 lines.append(
                     f"    Rank test: F={float(np.atleast_1d(rk_sum['rank_F'])[0]):.2f}"
@@ -1108,6 +1109,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     g.add_argument("--var-min-rank", type=int, default=1,
                    help="Piso de rango local para rank-method=variance. "
                         "Default: 1")
+    g.add_argument("--max-common", type=int, default=30,
+                   help="Tope del pool de candidatos comunes de A1-A5 "
+                        "(dimension de W, el candidato maximo de r0). "
+                        "Default: 30. Si A6 acepta TODOS los candidatos "
+                        "(r0 = max_common), el backbone esta censurado: "
+                        "subalo junto con var_max_rank.")
     g.add_argument("--a6-n-null", type=int, default=100)
     g.add_argument("--a6-max-common", type=int, default=0,
                    help="Candidatos a testear en A6. 0 = todos los de "
@@ -1514,6 +1521,7 @@ def main(argv: list[str] | None = None) -> int:
         var_explained=args.var_explained,
         var_max_rank=args.var_max_rank,
         var_min_rank=args.var_min_rank,
+        max_common=args.max_common,
         a6_n_null=args.a6_n_null,
         a6_max_common=args.a6_max_common,
         a6_null_type=args.a6_null_type,

@@ -447,6 +447,8 @@ class CDHSABatchRunner:
                         cdhsa.get("var_min_rank", 1))
         logger.info("    a6_max_common  : %s",
                     cdhsa.get("a6_max_common", 0))
+        logger.info("    max_common     : %s (tope del pool de A1-A5)",
+                    cdhsa.get("max_common", 30))
         logger.info("    a6_null_type   : %s",
                     cdhsa.get("a6_null_type", "haar"))
         logger.info("    a6_n_null      : %d", cdhsa.get("a6_n_null", 100))
@@ -521,15 +523,16 @@ class CDHSABatchRunner:
         rtag = CDHSABatchRunner._rank_tag(cdhsa)
         tb = cdhsa.get("tangent_blocks_mode", "cumulative")[:4]
         bm = "bm0" if cdhsa.get("no_boundary_mask", False) else "bm1"
+        mc = f"mc{cdhsa.get('max_common', 30)}"
         if job.get("mode") == "multi_ss":
             return (f"multiss_{job['n_super_subjects']}|{job['session']}|"
                     f"{tasks_str}|{job['t_start']}|{job['t_end']}|"
-                    f"L{cdhsa.get('L', '?')}|{rtag}|{tb}|{bm}")
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}")
         else:
             sid = job["super_subject_id"]
             return (f"ss{sid:02d}|{job['session']}|{tasks_str}|"
                     f"{job['t_start']}|{job['t_end']}|"
-                    f"L{cdhsa.get('L', '?')}|{rtag}|{tb}|{bm}")
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}")
 
     # ------------------------------------------------------------------
     # CSV log
@@ -658,6 +661,7 @@ class CDHSABatchRunner:
             "--h-freq", str(cdhsa.get("h_freq", 40.0)),
             "--fixed-rank", str(cdhsa.get("fixed_rank", 10)),
             "--rank-method", str(cdhsa.get("rank_method", "fixed")),
+            "--max-common", str(cdhsa.get("max_common", 30)),
             "--a6-n-null", str(cdhsa.get("a6_n_null", 100)),
             "--bc-n-perm", str(cdhsa.get("bc_n_perm", 5000)),
             "--d-max-specific", str(cdhsa.get("d_max_specific", 10)),
