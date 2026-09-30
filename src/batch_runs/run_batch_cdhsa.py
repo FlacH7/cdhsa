@@ -65,6 +65,22 @@ From the directory containing this script::
 
     # Override via environment variable
     BATCH_CDHSA_PARAMS_JSON=/path/to/params.json python run_batch_cdhsa.py
+
+Notifications
+------------
+If ``NTFY_CHANNEL`` is defined in the ``.env`` (see ``src/ntfy/README.md``),
+the batch sends push notifications through https://ntfy.sh:
+
+* an **info** when the batch starts (doubles as a canary: if it does not
+  reach the phone, the channel is misconfigured),
+* an **urgent error** for every job that dies (the batch keeps going),
+* a final **success** (``Fallos == 0``) or **warning** with the summary,
+* an **urgent error with traceback** if an uncaught exception (or a
+  ``sys.exit`` with non-zero code, e.g. a broken params JSON) kills the
+  whole batch.
+
+Without ``NTFY_CHANNEL`` all of this is a silent no-op and the batch
+behaves exactly as before.
 """
 
 from __future__ import annotations
@@ -74,6 +90,7 @@ import csv
 import json
 import logging
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -96,6 +113,38 @@ except ImportError:
     _HAS_MEM_TRACKER = False
 
 # ---------------------------------------------------------------------------
+# [NTFY] Push notifications for long runs (optional; see src/ntfy/README.md)
+# ---------------------------------------------------------------------------
+# The channel is imported from src.utils.config exactly like the rest of
+# the environment variables, but in a separate try-block so that:
+#   * an outdated config.py without NTFY_CHANNEL only disables notifications,
+#   * main()'s decorator knows the channel even if the params JSON fails
+#     before the runner is created.
+try:
+    from src.utils.config import NTFY_CHANNEL as _NTFY_CHANNEL
+except Exception:  # ImportError if src.* is not in the path
+    _NTFY_CHANNEL = None
+
+try:
+    from src.ntfy import (
+        notify_error,
+        notify_info,
+        notify_success,
+        notify_warning,
+        notify_on_critical_error,
+    )
+    _HAS_NTFY = True
+except ImportError:
+    # Without src/ntfy the batch works exactly the same (notifications off).
+    _HAS_NTFY = False
+
+    def notify_on_critical_error(_func=None, **_kwargs):
+        """No-op shim: src.ntfy not available (notifications disabled)."""
+        def _deco(func):
+            return func
+        return _deco(_func) if _func is not None else _deco
+
+# ---------------------------------------------------------------------------
 # Ensure the directory containing run_cdhsa.py is importable
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -111,6 +160,9 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("batch_cdhsa")
+
+# [NTFY] Host included in the push notifications
+_HOST = socket.gethostname()
 
 # ---------------------------------------------------------------------------
 # Default JSON path
@@ -363,6 +415,26 @@ class CDHSABatchRunner:
             self.output_dir = Path("./results")
             self.cache_dir = Path("./cache")
             self.params_dir = Path("./params")
+
+        # [NTFY] Notification channel: imported from src.utils.config like
+        # every other environment variable.  Separate try-block so an
+        # outdated config.py without NTFY_CHANNEL only disables notifications.
+        try:
+            from src.utils.config import NTFY_CHANNEL
+            self.ntfy_channel: str | None = (NTFY_CHANNEL or "").strip() or None
+        except ImportError:
+            self.ntfy_channel = None
+
+        if self.ntfy_channel:
+            logger.info(
+                "[NTFY] Notificaciones push ACTIVAS (canal: %s)",
+                self.ntfy_channel,
+            )
+        else:
+            logger.info(
+                "[NTFY] Notificaciones push desactivadas (define NTFY_CHANNEL "
+                "en el .env; ver src/ntfy/README.md)",
+            )
 
     def _resolve_log_path(self) -> Path:
         """Resolve the path for the batch CSV log file."""
@@ -904,6 +976,38 @@ class CDHSABatchRunner:
                 logger.warning("[MEM] Error guardando per-job CSV: %s", exc)
 
     # ------------------------------------------------------------------
+    # [NTFY] Push notifications
+    # ------------------------------------------------------------------
+
+    def _notify(self, level: str, message: str, title: str | None = None) -> None:
+        """Send a push notification through ntfy (best-effort, never raises).
+
+        ``level`` is one of ``info | success | warning | error``.  Without a
+        configured channel (or without the ``src.ntfy`` module) this is a
+        silent no-op, so it is always safe to call.
+        """
+        if not (_HAS_NTFY and self.ntfy_channel):
+            return
+        senders = {
+            "info": notify_info,
+            "success": notify_success,
+            "warning": notify_warning,
+            "error": notify_error,
+        }
+        fn = senders.get(level)
+        if fn is None:
+            logger.warning("[NTFY] Nivel de notificacion desconocido: %r", level)
+            return
+        try:
+            if title is not None:
+                fn(message, channel=self.ntfy_channel, title=title)
+            else:
+                fn(message, channel=self.ntfy_channel)
+        except Exception as exc:
+            # Paranoia: a notification must never kill the batch.
+            logger.warning("[NTFY] Fallo enviando notificacion: %s", exc)
+
+    # ------------------------------------------------------------------
     # Run a single job
     # ------------------------------------------------------------------
 
@@ -917,6 +1021,14 @@ class CDHSABatchRunner:
             logger.error(
                 "Error construyendo comando para %s/%s: %s",
                 label, job["session"], exc,
+            )
+            self._notify(
+                "error",
+                "Error construyendo el comando para %s/%s:\n%s\n"
+                "El batch continua con los demas jobs." % (
+                    label, job["session"], exc,
+                ),
+                title="[CD-HSA] Fallo de job",
             )
             return key, False
 
@@ -1002,6 +1114,14 @@ class CDHSABatchRunner:
                     label, job["session"],
                     proc.returncode,
                 )
+                self._notify(
+                    "error",
+                    "Job %s/%s termino con codigo %d (fallo).\n"
+                    "El batch continua con los demas jobs." % (
+                        label, job["session"], proc.returncode,
+                    ),
+                    title="[CD-HSA] Fallo de job",
+                )
 
             # [MEM TRACKING] Checkpoint after job
             if _HAS_MEM_TRACKER:
@@ -1017,6 +1137,14 @@ class CDHSABatchRunner:
             logger.error(
                 "EXCEPTION | %s/%s: %s",
                 label, job["session"], exc,
+            )
+            self._notify(
+                "error",
+                "Excepcion ejecutando %s/%s:\n%s: %s\n"
+                "El batch continua con los demas jobs." % (
+                    label, job["session"], type(exc).__name__, exc,
+                ),
+                title="[CD-HSA] Fallo de job",
             )
             self._write_csv_log(
                 job, False, -1, elapsed, cmd_for_log,
@@ -1077,7 +1205,10 @@ class CDHSABatchRunner:
 
             n_found = 0
             for job in jobs:
-                ss_label = job["super_subject_label"]
+                ss_label = job.get(
+                    "super_subject_label",
+                    f"multi-SS(S={job.get('n_super_subjects', '?')})",
+                )
                 out_dir = self._get_output_dir(job)
                 summary_path = out_dir / "cdhsa_summary.txt"
                 config_path = out_dir / "config.json"
@@ -1315,11 +1446,36 @@ class CDHSABatchRunner:
         todo = self._filter_todo(self.all_jobs)
         total = len(todo)
 
+        # [NTFY] Startup notice: doubles as a canary (if it does not reach
+        # the phone, the channel is misconfigured and the run is pointless).
+        if total > 0:
+            tw = self.params["time_window"]
+            self._notify(
+                "info",
+                "Batch iniciado: %d job(s) por ejecutar (%d en total).\n"
+                "Label: %s\nVentana: %s - %s s | tasks: %d\n"
+                "Host: %s | workers: %d\nSalidas: %s" % (
+                    total, len(self.all_jobs),
+                    self.params.get("experiment_label", "batch_cdhsa"),
+                    tw["t_start"], tw["t_end"], len(self.params["tasks"]),
+                    _HOST, self.max_workers, self.output_dir,
+                ),
+                title="[CD-HSA] Batch iniciado",
+            )
+
+        _batch_t0 = time.time()
+
         if total == 0:
             logger.info("Todos los jobs ya estan completados.")
             self._run_mode_extraction()
             if self.run_comparison:
                 self._run_comparison()
+            self._notify(
+                "info",
+                "No habia jobs pendientes (checkpoint): solo se ejecuto el "
+                "post-procesamiento (extraccion de modos + comparacion).",
+                title="[CD-HSA] Batch ya completo",
+            )
             return 0
 
         logger.info("Total a ejecutar: %d / %d", total, len(self.all_jobs))
@@ -1345,6 +1501,28 @@ class CDHSABatchRunner:
 
         if self.run_comparison:
             self._run_comparison()
+
+        # [NTFY] Final notice (after post-processing): success only when
+        # not a single job failed.
+        _elapsed = time.strftime(
+            "%Hh %Mm %Ss", time.gmtime(time.time() - _batch_t0),
+        )
+        _resumen = (
+            "OK: %d | Fallos: %d | Total: %d\nDuracion: %s\nLabel: %s\n"
+            "Host: %s\nSalidas: %s" % (
+                completed, failed, total, _elapsed,
+                self.params.get("experiment_label", "batch_cdhsa"),
+                _HOST, self.output_dir,
+            )
+        )
+        if failed == 0:
+            self._notify("success", _resumen, title="[CD-HSA] Batch terminado OK")
+        else:
+            self._notify(
+                "warning",
+                _resumen + "\nLog CSV: %s" % self.log_file,
+                title="[CD-HSA] Batch terminado CON FALLOS",
+            )
 
         return 0 if failed == 0 else 1
 
@@ -1413,6 +1591,11 @@ class CDHSABatchRunner:
 # ===========================================================================
 
 
+@notify_on_critical_error(
+    channel=_NTFY_CHANNEL or None,
+    title="[CD-HSA] ERROR critico del batch",
+    catch_system_exit=True,
+)
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(

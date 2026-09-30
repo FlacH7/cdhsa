@@ -31,6 +31,12 @@ BASE_PARAMS_FILE = os.getenv("BASE_PARAMS_FILE")
 # Batch runs
 DEFAULT_BATCH_RUNS_WORKERS = int(os.getenv("DEFAULT_BATCH_RUNS_WORKERS", 1))
 
+# ntfy push notifications (optional; empty -> disabled).
+# Channel (topic) used by src/ntfy to notify the phone when a long batch
+# finishes or fails. Subscribe to the same topic in the ntfy mobile app.
+# See src/ntfy/README.md.
+NTFY_CHANNEL = os.getenv("NTFY_CHANNEL")
+
 os.makedirs(BASE_CACHE_PATH, exist_ok=True)
 os.makedirs(BASE_RESULTS_PATH, exist_ok=True)
 os.makedirs(BASE_PARAMS_FILE, exist_ok=True)
