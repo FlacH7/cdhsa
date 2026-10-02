@@ -1426,7 +1426,19 @@ def save_results(
 def _save_result_arrays(
     d: dict, prefix: str, out: dict[str, NDArray]
 ) -> None:
-    """Extraer arrays numericos de un dict de resultados y meterlos en out."""
+    """Extraer arrays numericos de un dict de resultados y meterlos en out.
+
+    v5.1 (fix ragged): con NumPy >= 1.24 ``np.array`` sobre una lista de
+    arrays con shapes incompatibles (p.ej. ``W_specific`` con r_c distinto
+    por condicion) LANZA ``ValueError`` ("inhomogeneous shape") en lugar
+    de devolver un array de dtype=object. La rama ``dtype.kind == "O"``
+    anterior era codigo muerto y el ``except`` se tragaba el error, con lo
+    que ``D__W_specific``/``D__U_residual`` se perdiAN SILENCIAMENTE del
+    cdhsa_arrays.npz y la extraccion de modos fallaba despues con
+    "No se encontro D__W_specific". Ahora: stack uniforme si se puede; si
+    no, cada elemento se guarda con clave indexada (formato que
+    extract_mode_indices ya sabe leer), recursando en sub-listas.
+    """
     for k, v in d.items():
         key = f"{prefix}__{k}"
         if isinstance(v, np.ndarray):
@@ -1434,20 +1446,26 @@ def _save_result_arrays(
         elif isinstance(v, dict):
             _save_result_arrays(v, key, out)
         elif isinstance(v, (list, tuple)) and len(v) > 0:
-            # Intentar convertir lista de arrays a stack
+            # Intentar convertir lista de arrays a stack uniforme
+            arr = None
             try:
                 arr = np.array(v)
-                if arr.dtype.kind in ("f", "i", "u", "b"):
-                    out[key] = arr
-                elif arr.dtype.kind == "O":
-                    # Ragged (p.ej. r_c distinto por condicion en Step D):
-                    # guardar cada elemento con clave indexada
-                    # (D__W_specific__0, D__W_specific__1, ...).
-                    for i, item in enumerate(v):
-                        if isinstance(item, np.ndarray):
-                            out[f"{key}__{i}"] = item
             except (ValueError, TypeError):
-                pass
+                arr = None
+            if (isinstance(arr, np.ndarray)
+                    and arr.dtype.kind in ("f", "i", "u", "b")):
+                out[key] = arr
+                continue
+            # Ragged (shapes incompatibles, p.ej. r_c distinto por
+            # condicion en Step D): guardar cada elemento con clave
+            # indexada (D__W_specific__0, D__W_specific__1, ...).
+            for i, item in enumerate(v):
+                if isinstance(item, np.ndarray):
+                    out[f"{key}__{i}"] = item
+                elif isinstance(item, (list, tuple)) and len(item) > 0:
+                    # Sub-lista (p.ej. U_residual[s][c]): recursion con el
+                    # prefijo ya indexado -> D__U_residual__{s}__{c}
+                    _save_result_arrays({str(i): item}, key, out)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -367,9 +367,22 @@ def build_mode_map(
         per_condition = []
         for c_idx in range(C):
             W_c = npz_data[f'D__W_specific__{c_idx}']
-            lam_c = (npz_data[f'D__lambda_specific__{c_idx}']
-                     if f'D__lambda_specific__{c_idx}' in npz_data
-                     else None)
+            rc = int(r_specific[c_idx])
+            lam_c = None
+            if f'D__lambda_specific__{c_idx}' in npz_data:
+                # Guardado ragged (clave por condicion)
+                lam_c = npz_data[f'D__lambda_specific__{c_idx}']
+            elif lam_all is not None and lam_all.ndim == 2 \
+                    and lam_all.shape[0] == C:
+                # v5.1: lambda_specific suele ser uniforme (el pool da qmax
+                # candidatos por condicion y SOLO W se recorta a r_c), asi
+                # que se guarda apilada como (C, qmax) aunque W sea ragged:
+                # recortar la fila a r_c igual que W.
+                lam_c = np.asarray(lam_all[c_idx])[:rc]
+            elif lam_all is not None and lam_all.ndim == 1:
+                # Flat concatenado por bloques de r_specific
+                offset = int(np.sum(r_specific[:c_idx]))
+                lam_c = lam_all[offset:offset + rc]
             per_condition.append((W_c, lam_c))
         w_npz_key = 'D__W_specific__{c}'
         w_shape_full = None

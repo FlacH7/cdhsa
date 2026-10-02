@@ -1390,6 +1390,22 @@ class CDHSABatchRunner:
         if n_ok > 0:
             logger.info("  JSONs guardados en: %s", self.params_dir)
 
+        # [NTFY] v5.1: un fallo de extraccion ya no puede esconderse detras
+        # de un "Batch terminado OK" (le paso a la corrida del 2026-09-30:
+        # push verde mientras el mode_map.json nunca se genero).
+        if n_fail > 0:
+            self._notify(
+                "error",
+                "La extraccion de modos fallo para %d de %d job(s) con "
+                "resultados.\n"
+                "El pipeline termino bien (no hace falta re-correrlo); "
+                "revisa el traceback en la seccion 'EXTRAYENDO INDICES "
+                "DE MODOS ESPECIFICOS' del log." % (n_fail, n_ok + n_fail),
+                title="[CD-HSA] Extraccion de modos FALLO",
+            )
+
+        return n_ok, n_skip, n_fail
+
     # ------------------------------------------------------------------
     # Main orchestration
     # ------------------------------------------------------------------
@@ -1467,13 +1483,16 @@ class CDHSABatchRunner:
 
         if total == 0:
             logger.info("Todos los jobs ya estan completados.")
-            self._run_mode_extraction()
+            n_ok_x, n_skip_x, n_fail_x = self._run_mode_extraction()
             if self.run_comparison:
                 self._run_comparison()
             self._notify(
-                "info",
+                "info" if n_fail_x == 0 else "warning",
                 "No habia jobs pendientes (checkpoint): solo se ejecuto el "
-                "post-procesamiento (extraccion de modos + comparacion).",
+                "post-procesamiento (extraccion de modos + comparacion).\n"
+                "Extraccion de modos: OK=%d, Skip=%d, Fail=%d" % (
+                    n_ok_x, n_skip_x, n_fail_x,
+                ),
                 title="[CD-HSA] Batch ya completo",
             )
             return 0
@@ -1497,25 +1516,29 @@ class CDHSABatchRunner:
         )
         logger.info("Log CSV: %s", self.log_file)
 
-        self._run_mode_extraction()
+        n_ok_x, n_skip_x, n_fail_x = self._run_mode_extraction()
 
         if self.run_comparison:
             self._run_comparison()
 
         # [NTFY] Final notice (after post-processing): success only when
-        # not a single job failed.
+        # not a single job failed AND the mode extraction succeeded.
         _elapsed = time.strftime(
             "%Hh %Mm %Ss", time.gmtime(time.time() - _batch_t0),
         )
         _resumen = (
-            "OK: %d | Fallos: %d | Total: %d\nDuracion: %s\nLabel: %s\n"
+            "OK: %d | Fallos: %d | Total: %d\n"
+            "Extraccion de modos: OK=%d, Skip=%d, Fail=%d\n"
+            "Duracion: %s\nLabel: %s\n"
             "Host: %s\nSalidas: %s" % (
-                completed, failed, total, _elapsed,
+                completed, failed, total,
+                n_ok_x, n_skip_x, n_fail_x,
+                _elapsed,
                 self.params.get("experiment_label", "batch_cdhsa"),
                 _HOST, self.output_dir,
             )
         )
-        if failed == 0:
+        if failed == 0 and n_fail_x == 0:
             self._notify("success", _resumen, title="[CD-HSA] Batch terminado OK")
         else:
             self._notify(
