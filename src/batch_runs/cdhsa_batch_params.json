@@ -1,6 +1,6 @@
 {
-  "experiment_label": "multiss_cdhsa_5ss_5tasks_v5_variance_uncensored",
-  "_comment_experiment": "CD-HSA multi-SS (S=5, C=5) v5: igual que v4 pero con los topes levantados para eliminar la cadena de censura de la corrida v4 (rangos locales 25/25 censurados a 50; r0=30=todo el pool max_common; especificos 16/16=tope; test de rango degenerado como consecuencia). Cambios: var_max_rank 50->200, max_common 30->60 (requiere el patch v5 de plumbing: --max-common CLI + passthrough batch), d_max_specific 16->32. NOTA: con este regimen (super-sujetos concatenados) es posible que r0 siga = pool (lambda/pi no decaen); reportar como r0 >= pool con la divulgacion correspondiente.",
+  "experiment_label": "multiss_cdhsa_5ss_5tasks_v4_variance",
+  "_comment_experiment": "CD-HSA multi-SS (S=5, C=5) v4: (1) rango local por varianza explicada X=99% (tope 50) — revive el test de rango del Step B (Remark 3.6); (2) bloques tangentes acumulativos B_k={1..k} con el ESTADISTICO del paper L=(I−W_kW_k^T)U_{1:k} (v4); (3) Step D con rank adaptativo por test Haar (Def. 3.13) y calibracion LOSO (Def. 3.15); (4) consistencia por replica Framework 2 (Seccion 4.5, criterio >=4/5); (5) enmascaramiento de las columnas de nivel 2 que cruzan fronteras de concatenacion entre sujetos (paper; no_boundary_mask=false). a6_max_common=0 => se testean TODOS los candidatos de A1-A5.",
 
   "super_subjects": {
     "n_super_subjects": 5,
@@ -27,15 +27,14 @@
     "fixed_rank": 20,
     "rank_method": "variance",
     "var_explained": 0.95,
-    "var_max_rank": 200,
+    "var_max_rank": 100,
     "var_min_rank": 1,
-    "max_common": 100,
     "a6_max_common": 0,
     "a6_null_type": "haar",
     "a6_n_null": 200,
     "bc_n_perm": 5000,
     "tangent_blocks_mode": "cumulative",
-    "d_max_specific": 64,
+    "d_max_specific": 16,
     "d_rank_adaptive": true,
     "d_n_null_specific": 200,
     "d_alpha_specific": 0.05,
@@ -46,8 +45,48 @@
     "skip_bc": false,
     "skip_tangent": false,
     "skip_d": false,
-    "_comment_costs": "Coste estimado v5 con rangos ~100-200 y max_common=60: A1-A5 (svds k=200 x 25 grabaciones) ~5-6 h; A6+BC+tangente(60 bloques)+D(32 modos)+LOSO+replica ~2.5-3.5 h; guardado ~40 min. Total ~9-12 h (overnight). RAM ~67-70 GB (sin cambio: dominan las 25 matrices H). Si eyesopen sigue censurado a 200 (espectro muy ancho), reportarlo como hallazgo (mayor amplitud espectral) — el test de rango revive igual mientras los rangos VARIEN. El nulo 'hankel' (a6_null_type) sigue siendo para la comparacion aparte de la Seccion 7.",
+    "_comment_costs": "Coste A6 ~ O(n_null * r^2): con rangos ~50 y a6_n_null=200 espere ~2-4 h (con 500 serian ~7 h). Si el summary reporta censored=25/25, el espectro necesita mas de var_max_rank componentes para X=99%: suba var_max_rank (el coste crece ~cuadratico) o baje var_explained a 0.95. El nulo 'hankel' (a6_null_type) cuesta ~10-15 min POR replica en este protocolo: usar solo para la comparacion final del paper con pocas replicas (20-100) o planificar n_null=500+ para la inferencia final.",
     "_comment_nulos": "Para la comparacion Haar vs Hankel-preservante prometida en la Seccion 7: cambiar a6_null_type a 'hankel' (el pipeline autodetecta el row_block desde hankel_depth). NO cambiar de nulo a mitad de un analisis: declararlo a priori como en el paper."
+  },
+
+  "latent_plots": {
+    "enabled": true,
+    "_comment": "Fase posterior al CD-HSA + extraccion de modos: espacio latente + TODOS los plots previos al KM (incluida la influencia de los canales originales sobre cada dimension latente), SIN coeficientes de Kramers-Moyal ni potenciales. Los paths de mode_map_path/npz_path se AUTO-INYECTAN desde los resultados de esta misma corrida (no hacen falta ${VAR} ni entradas nuevas en el .env). Requiere modo multi-SS (n_super_subjects).",
+
+    "pipeline_module": "src.pipelines.latent_space_plots_from_eeg_gedai_super_subject",
+
+    "methods": [
+      {
+        "label": "hankel+cdhsa+top_4",
+        "_comment": "stage1_params.depth se auto-inyecta desde cdhsa_params.hankel_depth si se omite. mode_map_path/npz_path se auto-inyectan; si los pones aqui a mano, ganan sobre los auto-inyectados.",
+        "stage1_embedding": "hankel",
+        "stage1_params": {"depth": 10},
+        "stage2_dynamics": "cdhsa_specific_modes",
+        "stage2_params": {},
+        "stage3_selection": "top_n",
+        "stage3_params": {}
+      }
+    ],
+
+    "shared_params": {
+      "latent_dim": 4,
+      "l_freq": 1.0,
+      "h_freq": 40.0,
+      "ica_method": "picard",
+      "analysis_dim": null,
+      "column": null,
+      "workers": null,
+      "hankel_embedding_depth": null,
+      "verbose": true,
+      "ignore_cache": false,
+      "_comment_shared": "l_freq/h_freq por defecto toman los valores de cdhsa_params si se omiten. latent_dim=4 y top_n del mode_map (mode_extract_top_n) deben ser coherentes."
+    },
+
+    "execution": {
+      "max_workers": 1,
+      "delay": 2.0,
+      "_comment_exec": "max_workers=1 (secuencial) recomendado: cada job latente materializa el block-Hankel (~25-35 GB peak RSS con esta config)."
+    }
   },
 
   "execution": {
