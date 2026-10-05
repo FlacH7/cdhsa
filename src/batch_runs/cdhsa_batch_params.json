@@ -1,6 +1,6 @@
 {
-  "experiment_label": "multiss_cdhsa_5ss_5tasks_v4_variance",
-  "_comment_experiment": "CD-HSA multi-SS (S=5, C=5) v4: (1) rango local por varianza explicada X=99% (tope 50) — revive el test de rango del Step B (Remark 3.6); (2) bloques tangentes acumulativos B_k={1..k} con el ESTADISTICO del paper L=(I−W_kW_k^T)U_{1:k} (v4); (3) Step D con rank adaptativo por test Haar (Def. 3.13) y calibracion LOSO (Def. 3.15); (4) consistencia por replica Framework 2 (Seccion 4.5, criterio >=4/5); (5) enmascaramiento de las columnas de nivel 2 que cruzan fronteras de concatenacion entre sujetos (paper; no_boundary_mask=false). a6_max_common=0 => se testean TODOS los candidatos de A1-A5.",
+  "experiment_label": "multiss_cdhsa_5ss_5tasks_v5_1_variance_uncensored",
+  "_comment_experiment": "CD-HSA multi-SS (S=5, C=5) v5.1 (uncensored) + fase latente. Config IDENTICA a la corrida v5.1 ya completada (2026-10-02, r0=57, r_specific ragged [43,64,43,42,47]): rango local por varianza explicada X=95% (tope 200, piso 1), max_common=100 (tope del pool A1-A5; OJO: NO es el default 30 del codigo), d_max_specific=64 adaptativo (Def. 3.13) + calibracion LOSO (Def. 3.15), bloques tangentes acumulativos con el estadistico del paper, consistencia por replica Framework 2 (>=4/5), enmascaramiento de fronteras ON (no_boundary_mask=false), a6_max_common=0 (todos los candidatos), + bloque latent_plots (25 jobs de espacio latente y plots pre-KM). [CHECKPOINT] La clave del checkpoint es multiss_{N}|{session}|{tasks}|{t0}|{t1}|L{L}|var{X}c{cap}|mc{max_common}|{bloques}|bm{mascaras}: cambiar L, var_explained, var_max_rank, max_common, tangent_blocks_mode o no_boundary_mask genera OTRA clave y el cache NO se reconoce (el job se re-ejecuta). Esta config genera EXACTAMENTE la clave de la corrida completada: multiss_5|session1|eyesclosed+eyesopen+mathematic+memory+music|100.0|200.0|L10|var95c200|mc100|cumu|bm1.",
 
   "super_subjects": {
     "n_super_subjects": 5,
@@ -27,14 +27,15 @@
     "fixed_rank": 20,
     "rank_method": "variance",
     "var_explained": 0.95,
-    "var_max_rank": 100,
+    "var_max_rank": 200,
     "var_min_rank": 1,
+    "max_common": 100,
     "a6_max_common": 0,
     "a6_null_type": "haar",
     "a6_n_null": 200,
     "bc_n_perm": 5000,
     "tangent_blocks_mode": "cumulative",
-    "d_max_specific": 16,
+    "d_max_specific": 64,
     "d_rank_adaptive": true,
     "d_n_null_specific": 200,
     "d_alpha_specific": 0.05,
@@ -45,7 +46,7 @@
     "skip_bc": false,
     "skip_tangent": false,
     "skip_d": false,
-    "_comment_costs": "Coste A6 ~ O(n_null * r^2): con rangos ~50 y a6_n_null=200 espere ~2-4 h (con 500 serian ~7 h). Si el summary reporta censored=25/25, el espectro necesita mas de var_max_rank componentes para X=99%: suba var_max_rank (el coste crece ~cuadratico) o baje var_explained a 0.95. El nulo 'hankel' (a6_null_type) cuesta ~10-15 min POR replica en este protocolo: usar solo para la comparacion final del paper con pocas replicas (20-100) o planificar n_null=500+ para la inferencia final.",
+    "_comment_costs": "Coste v5.1 OBSERVADO en la corrida real (2026-10-02): ~6.5 h y ~67 GB RSS con rangos locales 23-63, r0=57, r_specific ragged. d_max_specific=64: si eyesopen vuelve a quedar al tope, reportar el espectro lambda/pi (recomendacion Task 8) en vez de subir el tope otra vez. Con este JSON el batch SALTA el CD-HSA por checkpoint y solo ejecuta extraccion de modos + fase latente (~6-12 h adicionales, ~30-40 GB por job latente). El nulo 'hankel' (a6_null_type) es para la comparacion aparte de la Seccion 7: NO cambiar a mitad de un analisis.",
     "_comment_nulos": "Para la comparacion Haar vs Hankel-preservante prometida en la Seccion 7: cambiar a6_null_type a 'hankel' (el pipeline autodetecta el row_block desde hankel_depth). NO cambiar de nulo a mitad de un analisis: declararlo a priori como en el paper."
   },
 
