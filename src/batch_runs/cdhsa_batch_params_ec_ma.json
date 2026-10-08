@@ -1,0 +1,99 @@
+{
+  "experiment_label": "multiss_cdhsa_5ss_5tasks_v5_1_variance_uncensored",
+  "_comment_experiment": "CD-HSA multi-SS (S=5, C=5) v5.1 (uncensored) + fase latente. Config IDENTICA a la corrida v5.1 ya completada (2026-10-02, r0=57, r_specific ragged [43,64,43,42,47]): rango local por varianza explicada X=95% (tope 200, piso 1), max_common=100 (tope del pool A1-A5; OJO: NO es el default 30 del codigo), d_max_specific=64 adaptativo (Def. 3.13) + calibracion LOSO (Def. 3.15), bloques tangentes acumulativos con el estadistico del paper, consistencia por replica Framework 2 (>=4/5), enmascaramiento de fronteras ON (no_boundary_mask=false), a6_max_common=0 (todos los candidatos), + bloque latent_plots (25 jobs de espacio latente y plots pre-KM). [CHECKPOINT] La clave del checkpoint es multiss_{N}|{session}|{tasks}|{t0}|{t1}|L{L}|var{X}c{cap}|mc{max_common}|{bloques}|bm{mascaras}: cambiar L, var_explained, var_max_rank, max_common, tangent_blocks_mode o no_boundary_mask genera OTRA clave y el cache NO se reconoce (el job se re-ejecuta). Esta config genera EXACTAMENTE la clave de la corrida completada: multiss_5|session1|eyesclosed+eyesopen+mathematic+memory+music|100.0|200.0|L10|var95c200|mc100|cumu|bm1.",
+
+  "super_subjects": {
+    "n_super_subjects": 5,
+    "subjects_per_super_subject": 12,
+    "subject_start_offset": 1,
+    "total_subjects": 60
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "mathematic"],
+
+  "time_window": {
+    "t_start": 0.0,
+    "t_end": 300.0,
+    "_comment": "Ventana temporal POR SUJETO. Con t_end=200 y 12 subjects, cada SS tiene 2400s.."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 20,
+    "rank_method": "variance",
+    "var_explained": 0.95,
+    "var_max_rank": 200,
+    "var_min_rank": 1,
+    "max_common": 100,
+    "a6_max_common": 0,
+    "a6_null_type": "haar",
+    "a6_n_null": 200,
+    "bc_n_perm": 5000,
+    "tangent_blocks_mode": "cumulative",
+    "d_max_specific": 64,
+    "d_rank_adaptive": true,
+    "d_n_null_specific": 200,
+    "d_alpha_specific": 0.05,
+    "d_loso": true,
+    "d_loso_n_perm": 1000,
+    "run_replica_consistency": true,
+    "no_boundary_mask": false,
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "_comment_costs": "Coste v5.1 OBSERVADO en la corrida real (2026-10-02): ~6.5 h y ~67 GB RSS con rangos locales 23-63, r0=57, r_specific ragged. d_max_specific=64: si eyesopen vuelve a quedar al tope, reportar el espectro lambda/pi (recomendacion Task 8) en vez de subir el tope otra vez. Con este JSON el batch SALTA el CD-HSA por checkpoint y solo ejecuta extraccion de modos + fase latente (~6-12 h adicionales, ~30-40 GB por job latente). El nulo 'hankel' (a6_null_type) es para la comparacion aparte de la Seccion 7: NO cambiar a mitad de un analisis.",
+    "_comment_nulos": "Para la comparacion Haar vs Hankel-preservante prometida en la Seccion 7: cambiar a6_null_type a 'hankel' (el pipeline autodetecta el row_block desde hankel_depth). NO cambiar de nulo a mitad de un analisis: declararlo a priori como en el paper."
+  },
+
+  "latent_plots": {
+    "enabled": true,
+    "_comment": "Fase posterior al CD-HSA + extraccion de modos: espacio latente + TODOS los plots previos al KM (incluida la influencia de los canales originales sobre cada dimension latente), SIN coeficientes de Kramers-Moyal ni potenciales. Los paths de mode_map_path/npz_path se AUTO-INYECTAN desde los resultados de esta misma corrida (no hacen falta ${VAR} ni entradas nuevas en el .env). Requiere modo multi-SS (n_super_subjects).",
+
+    "pipeline_module": "src.pipelines.latent_space_plots_from_eeg_gedai_super_subject",
+
+    "methods": [
+      {
+        "label": "hankel+cdhsa+top_4",
+        "_comment": "stage1_params.depth se auto-inyecta desde cdhsa_params.hankel_depth si se omite. mode_map_path/npz_path se auto-inyectan; si los pones aqui a mano, ganan sobre los auto-inyectados.",
+        "stage1_embedding": "hankel",
+        "stage1_params": {"depth": 10},
+        "stage2_dynamics": "cdhsa_specific_modes",
+        "stage2_params": {},
+        "stage3_selection": "top_n",
+        "stage3_params": {}
+      }
+    ],
+
+    "shared_params": {
+      "latent_dim": 4,
+      "l_freq": 1.0,
+      "h_freq": 40.0,
+      "ica_method": "picard",
+      "analysis_dim": null,
+      "column": null,
+      "workers": null,
+      "hankel_embedding_depth": null,
+      "verbose": true,
+      "ignore_cache": false,
+      "_comment_shared": "l_freq/h_freq por defecto toman los valores de cdhsa_params si se omiten. latent_dim=4 y top_n del mode_map (mode_extract_top_n) deben ser coherentes."
+    },
+
+    "execution": {
+      "max_workers": 1,
+      "delay": 2.0,
+      "_comment_exec": "max_workers=1 (secuencial) recomendado: cada job latente materializa el block-Hankel (~25-35 GB peak RSS con esta config)."
+    }
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4
+  }
+}
