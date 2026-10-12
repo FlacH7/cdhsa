@@ -22,6 +22,17 @@ What is KEPT (everything up to, but not including, the KM coefficients)
   (with cache), including the ``cdhsa_specific_modes`` Stage-2 strategy
   that projects the block-Hankel onto the condition-specific CD-HSA
   modes read from ``mode_map.json`` + ``cdhsa_arrays.npz``.
+* **Common-mode analysis** (``--common-mode-analysis``, effective with
+  ``cdhsa_specific_modes``): BEFORE the specific-mode plots, projects
+  the COMMON subspace ``W0`` (Step A6) onto this super-subject x task
+  recording and produces ``common_mode_projection.png`` (time series of
+  the dominant common modes), ``common_variance_explained.png``
+  (per-mode + cumulative variance explained, common vs specific),
+  ``common_channel_influence.png`` (heatmap of the influence of the
+  ORIGINAL channels on ALL common modes) + optional topoplots,
+  ``common_channel_influence_data.npz``, ``common_projection_data.npz``
+  and ``common_mode_analysis.json``.  The latent extraction itself is
+  untouched (spec_hash unchanged -> cache fully reused).
 * ALL pre-KM plots:
   - Stage 1 (Hankel): singular values, variance explained.
   - Stage 2 (dynamics): PCA variance, ICLabel summary, pre/post-ICA PSDs,
@@ -72,7 +83,8 @@ which auto-injects ``mode_map_path``/``npz_path``)::
         --stage2-dynamics cdhsa_specific_modes \\
         --stage2-params '{"mode_map_path": "params/mode_map_...json",
                           "npz_path": "results/cdhsa/.../cdhsa_arrays.npz"}' \\
-        --stage3-selection top_n --latent-dim 4
+        --stage3-selection top_n --latent-dim 4 \\
+        --common-mode-analysis
 """
 
 from __future__ import annotations
@@ -321,6 +333,44 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-verbose", action="store_false", dest="verbose",
         help="Silence the verbose INFO output of the loader/extraction.",
+    )
+    # ---- CD-HSA common-mode analysis (Step A6 / W0) ----
+    parser.add_argument(
+        "--common-mode-analysis", action="store_true",
+        help=(
+            "Analyse the COMMON modes (A6/W0) of the CD-HSA run before "
+            "the specific-mode plots: project the common subspace onto "
+            "this super-subject x task recording, compute per-mode "
+            "energy/variance-explained metrics (with the specific modes "
+            "as contrast), and plot the influence of the ORIGINAL "
+            "channels on ALL common modes (heatmap + topoplots). Only "
+            "effective with --stage2-dynamics cdhsa_specific_modes. "
+            "Does NOT change the latent extraction (spec_hash untouched), "
+            "so the latent cache is fully reused."
+        ),
+    )
+    parser.add_argument(
+        "--common-top-k-series", type=int, default=12,
+        help="Common modes shown in the time-series plot (default: 12).",
+    )
+    parser.add_argument(
+        "--common-top-k-topo", type=int, default=8,
+        help="Common modes shown as topoplots (default: 8).",
+    )
+    parser.add_argument(
+        "--common-chunk-cols", type=int, default=50_000,
+        help=(
+            "Columns of the level-2 block-Hankel projected per chunk "
+            "(memory control; default 50000 ≈ 2.1 GB per chunk at "
+            "p*L=5300)."
+        ),
+    )
+    parser.add_argument(
+        "--common-no-save-projection", action="store_true",
+        help=(
+            "Do NOT write common_projection_data.npz (the full Y0 "
+            "projection, ~r0 x (T-L+1) float64)."
+        ),
     )
     # ---- Hankel (legacy convenience; also usable as stage1 param) ----
     parser.add_argument(
@@ -707,6 +757,40 @@ def main() -> int:
                 print("  [OK] Plots Stage 1 guardados.")
         except Exception as e:
             print(f"  [WARN] Error en plots Stage 1: {e}")
+
+    # =====================================================================
+    # 1b. COMMON-MODE ANALYSIS (CD-HSA Step A6 / W0) — BEFORE the
+    #     specific-mode dynamics plots and the channel-influence figure.
+    # =====================================================================
+    if args.common_mode_analysis and spec["stage2_dynamics"] == "cdhsa_specific_modes":
+        print("\n" + "=" * 70)
+        print("  COMMON-MODE ANALYSIS (CD-HSA Step A6 / W0)")
+        print("=" * 70)
+        try:
+            from src.latent_space_extraction.common_mode_analysis import (
+                run_common_mode_analysis,
+            )
+            run_common_mode_analysis(
+                raw,
+                meta,
+                out_dir=out_dir,
+                sfreq=sfreq,
+                l_freq=args.l_freq,
+                h_freq=args.h_freq,
+                raw_psd_path=raw_psd_path,
+                top_k_series=args.common_top_k_series,
+                top_k_topo=args.common_top_k_topo,
+                chunk_cols=args.common_chunk_cols,
+                save_projection=not args.common_no_save_projection,
+            )
+            print("  [OK] Common-mode analysis guardado.")
+        except Exception as e:
+            print(f"  [WARN] Common-mode analysis omitido: {e}")
+    elif args.common_mode_analysis:
+        print(
+            "\n  [CommonModes] --common-mode-analysis solo aplica con "
+            "--stage2-dynamics cdhsa_specific_modes; omitido."
+        )
 
     # -----------------------------------------------------------------
     # STAGE 2: DYNAMICS PLOTS
