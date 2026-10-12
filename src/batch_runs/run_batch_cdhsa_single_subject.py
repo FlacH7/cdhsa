@@ -14,6 +14,26 @@ Single execution mode::
 
   There is no per-SS mode here (each subject IS its own sample).
 
+Classification experiment (v6)
+------------------------------
+
+  If the JSON declares a **train/test split** (``subjects.train`` +
+  ``subjects.test``) and a ``classification`` block, the batch runs TWO
+  phases per session:
+
+    1. **Train**: CD-HSA on the TRAIN subjects only (e.g. 1..40) with
+       the v5.1 parameter set (variance rank, adaptive Step D, LOSO).
+    2. **Classification (hold-out test)**: every recording of the TEST
+       subjects (e.g. 41..60, both tasks) is classified independently
+       by projecting its level-2 Hankel onto the condition-specific
+       subspaces learned from the train subjects.  Produces accuracy
+       (total and per task), confusion matrix, exact binomial p-value,
+       paired permutation p-value, AUC and ~10 paper-ready figures.
+
+  See ``src/cdhsa/classification.py`` for the mathematical framework
+  and EXPERIMENTO_CLASIFICACION.md (paquete del experimento) for the
+  full derivation.
+
 Configuration
 --------------
 Everything is controlled by the JSON file (default:
@@ -91,6 +111,38 @@ except ImportError:
     _HAS_MEM_TRACKER = False
 
 # ---------------------------------------------------------------------------
+# [NTFY] Push notifications for long runs (optional; see src/ntfy/README.md)
+# ---------------------------------------------------------------------------
+# The channel is imported from src.utils.config exactly like the rest of
+# the environment variables, but in a separate try-block so that:
+#   * an outdated config.py without NTFY_CHANNEL only disables notifications,
+#   * main()'s decorator knows the channel even if the params JSON fails
+#     before the runner is created.
+try:
+    from src.utils.config import NTFY_CHANNEL as _NTFY_CHANNEL
+except Exception:  # ImportError if src.* is not in the path
+    _NTFY_CHANNEL = None
+
+try:
+    from src.ntfy import (
+        notify_error,
+        notify_info,
+        notify_success,
+        notify_warning,
+        notify_on_critical_error,
+    )
+    _HAS_NTFY = True
+except ImportError:
+    # Without src/ntfy the batch works exactly the same (notifications off).
+    _HAS_NTFY = False
+
+    def notify_on_critical_error(_func=None, **_kwargs):
+        """No-op shim: src.ntfy not available (notifications disabled)."""
+        def _deco(func):
+            return func
+        return _deco(_func) if _func is not None else _deco
+
+# ---------------------------------------------------------------------------
 # Ensure the directory containing the pipeline scripts is importable
 # ---------------------------------------------------------------------------
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -135,7 +187,60 @@ def _load_params(json_path: Path) -> dict:
 
     subj_cfg = params["subjects"]
 
-    # The subjects block must declare either an explicit list or a count
+    # --- Esquema v6: experimento de clasificacion (train/test) ---
+    if ("train" in subj_cfg) or ("test" in subj_cfg):
+        for sub in ("train", "test"):
+            blk = subj_cfg.get(sub)
+            if not isinstance(blk, dict):
+                logger.error(
+                    "subjects.%s debe ser un objeto con 'n_subjects' "
+                    "(rango automatico) o 'subject_ids' (lista).", sub)
+                sys.exit(1)
+            if ("subject_ids" not in blk) and ("n_subjects" not in blk):
+                logger.error(
+                    "subjects.%s debe contener 'n_subjects' o "
+                    "'subject_ids'.", sub)
+                sys.exit(1)
+            if "subject_ids" in blk and (
+                    not isinstance(blk["subject_ids"], list)
+                    or not blk["subject_ids"]):
+                logger.error(
+                    "subjects.%s.subject_ids debe ser una lista no vacia.",
+                    sub)
+                sys.exit(1)
+            if "subject_ids" not in blk and (
+                    not isinstance(blk.get("n_subjects"), int)
+                    or blk["n_subjects"] <= 0):
+                logger.error(
+                    "subjects.%s.n_subjects debe ser un entero positivo.",
+                    sub)
+                sys.exit(1)
+
+        clf = params.get("classification", {})
+        if not isinstance(clf, dict):
+            logger.error("'classification' debe ser un objeto.")
+            sys.exit(1)
+        if clf.get("enabled", False):
+            if "test" not in subj_cfg:
+                logger.error(
+                    "classification.enabled=true requiere el bloque "
+                    "subjects.test.")
+                sys.exit(1)
+            method = clf.get("method", "energy")
+            if method not in ("energy", "ml", "both"):
+                logger.error(
+                    "classification.method debe ser 'energy' | 'ml' | "
+                    "'both'; se recibio %r.", method)
+                sys.exit(1)
+            if len(params["tasks"]) != 2:
+                logger.error(
+                    "El experimento de clasificacion es binario: "
+                    "'tasks' debe tener exactamente 2 tareas (se "
+                    "recibieron %d).", len(params["tasks"]))
+                sys.exit(1)
+        return _validate_cdhsa_params(params)
+
+    # --- Esquema legado: pool unico de sujetos ---
     has_ids = "subject_ids" in subj_cfg
     has_n = "n_subjects" in subj_cfg
 
@@ -155,12 +260,35 @@ def _load_params(json_path: Path) -> dict:
             logger.error("'subjects.n_subjects' debe ser un entero positivo.")
             sys.exit(1)
 
-    # Validate cdhsa_params
+    # [v6] Guarda: 'classification' solo tiene sentido con el esquema
+    # train/test. Con el pool unico (legado), enabled=true seria un error
+    # de configuracion silenciosamente ignorado -> abortar en su lugar.
+    clf = params.get("classification", {})
+    if not isinstance(clf, dict):
+        logger.error("'classification' debe ser un objeto.")
+        sys.exit(1)
+    if clf.get("enabled", False):
+        logger.error(
+            "classification.enabled=true requiere el esquema v6 con "
+            "subjects.train y subjects.test (el bloque 'subjects' actual "
+            "declara un unico pool).")
+        sys.exit(1)
+
+    return _validate_cdhsa_params(params)
+
+
+def _validate_cdhsa_params(params: dict) -> dict:
+    """Validacion comun del bloque cdhsa_params (esquemas legado y v6)."""
     cdhsa = params["cdhsa_params"]
     if "L" not in cdhsa:
         logger.error("'cdhsa_params' debe contener 'L' (subspace dimension).")
         sys.exit(1)
-
+    rank_method = cdhsa.get("rank_method", "fixed")
+    if rank_method not in ("fixed", "reproducibility", "variance"):
+        logger.error(
+            "cdhsa_params.rank_method invalido: %r (fixed | "
+            "reproducibility | variance).", rank_method)
+        sys.exit(1)
     return params
 
 
@@ -185,6 +313,32 @@ def _resolve_subject_ids(subj_cfg: dict) -> list[int]:
     return list(range(offset, offset + n))
 
 
+def _resolve_split_subjects(params: dict) -> tuple[list[int], list[int] | None]:
+    """Resolver el split train/test del esquema v6 (con guarda de fuga).
+
+    Returns
+    -------
+    (train_ids, test_ids | None)
+    """
+    subj_cfg = params["subjects"]
+    if "train" not in subj_cfg and "test" not in subj_cfg:
+        return _resolve_subject_ids(subj_cfg), None
+    if "train" not in subj_cfg:
+        logger.error("Esquema v6: falta subjects.train.")
+        sys.exit(1)
+    train_ids = _resolve_subject_ids(subj_cfg["train"])
+    test_ids = (_resolve_subject_ids(subj_cfg["test"])
+                if "test" in subj_cfg else None)
+    if test_ids is not None:
+        overlap = sorted(set(train_ids) & set(test_ids))
+        if overlap:
+            logger.error(
+                "FUGA DE DATOS: los sujetos %s aparecen en train Y test.",
+                overlap)
+            sys.exit(1)
+    return train_ids, test_ids
+
+
 def _subjects_label(job: dict) -> str:
     """Short label for the job's subject pool, e.g. ``nSub60`` or
     ``subj_1-60``."""
@@ -206,8 +360,11 @@ def _generate_jobs(params: dict) -> list[dict]:
     Single mode (``single_subject``): one job per session.  All
     individual subjects are passed together to a single invocation of
     ``run_cdhsa_single_subject.py`` (S=n_subjects, C=tasks).
+
+    Con el esquema v6 (train/test), los jobs usan el pool TRAIN; la
+    fase de clasificacion sobre el pool TEST se orquesta aparte
+    (``_run_classification_phase``).
     """
-    subj_cfg = params["subjects"]
     sessions = params["sessions"]
     tasks = params["tasks"]
     tw = params.get("time_window", {})
@@ -215,12 +372,13 @@ def _generate_jobs(params: dict) -> list[dict]:
     t_start = str(tw.get("t_start"))
     t_end = str(tw.get("t_end"))
 
-    subject_ids = _resolve_subject_ids(subj_cfg)
+    subject_ids, _test_ids = _resolve_split_subjects(params)
 
     jobs: list[dict] = []
     for session in sessions:
         jobs.append({
             "mode": "single_subject",
+            "phase": "train",
             "subject_ids": subject_ids,
             "n_subjects": len(subject_ids),
             "session": session,
@@ -240,21 +398,25 @@ def _generate_jobs(params: dict) -> list[dict]:
 class SingleSubjectCDHSABatchRunner:
     """Orchestrates batch execution of the single-subject CD-HSA pipeline."""
 
-    DEFAULT_PIPELINE_MODULE = "src.pipelines.run_cdhsa_single_subject"
-
     CSV_FIELDS = [
-        "timestamp", "mode", "subjects", "session", "tasks",
+        "timestamp", "mode", "phase", "subjects", "session", "tasks",
         "L", "fixed_rank", "hankel_depth",
         "t_start", "t_end", "success", "returncode",
         "elapsed_s", "command",
     ]
 
+    DEFAULT_PIPELINE_MODULE = "src.pipelines.run_cdhsa_single_subject"
+    DEFAULT_CLASSIFICATION_MODULE = "src.pipelines.run_cdhsa_task_classification"
+
     def __init__(self, params: dict, *, pipeline_script: Path | None = None,
-                 pipeline_module: str | None = None) -> None:
+                 pipeline_module: str | None = None,
+                 classification_module: str | None = None) -> None:
         self.params = params
         self.pipeline_script = pipeline_script or (
             _SCRIPT_DIR.parent / "pipelines" / "run_cdhsa_single_subject.py")
         self.pipeline_module = pipeline_module or self.DEFAULT_PIPELINE_MODULE
+        self.classification_module = (
+            classification_module or self.DEFAULT_CLASSIFICATION_MODULE)
         self.subj_cfg = params["subjects"]
         self.exec_cfg = params.get("execution", {})
 
@@ -263,10 +425,18 @@ class SingleSubjectCDHSABatchRunner:
         self.max_workers: int = self.exec_cfg.get("max_workers", 1)
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
 
+        # [v6] Experimento de clasificacion (hold-out)
+        self.classification_cfg: dict = params.get("classification", {})
+        _train_ids, self.test_subject_ids = _resolve_split_subjects(params)
+        self.classification_enabled = (
+            bool(self.classification_cfg.get("enabled", False))
+            and self.test_subject_ids is not None)
+
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
         self.output_dir: Path | None = None
         self.cache_dir: Path | None = None
+        self.ntfy_channel: str | None = None
         self._resolve_project_paths()
 
         # Checkpoint
@@ -282,6 +452,9 @@ class SingleSubjectCDHSABatchRunner:
 
         # [MEM TRACKING] Per-job memory stats
         self._job_memory_stats: list[dict] = []
+
+        # [v6] Resumenes de la fase de clasificacion (para log/ntfy)
+        self._classification_summaries: list[str] = []
 
     # ------------------------------------------------------------------
     # Project paths
@@ -308,6 +481,50 @@ class SingleSubjectCDHSABatchRunner:
             self.output_dir = Path("./results")
             self.cache_dir = Path("./cache")
             self.params_dir = Path("./params")
+
+        # [NTFY] Canal de notificaciones (misma cadena que run_batch_cdhsa)
+        try:
+            from src.utils.config import NTFY_CHANNEL
+            self.ntfy_channel = (NTFY_CHANNEL or "").strip() or None
+        except Exception:
+            self.ntfy_channel = None
+        if self.ntfy_channel:
+            logger.info(
+                "  NTFY channel    : %s (notificaciones push activas)",
+                self.ntfy_channel,
+            )
+
+    # ------------------------------------------------------------------
+    # [NTFY] Notificaciones
+    # ------------------------------------------------------------------
+
+    def _notify(self, level: str, message: str, title: str | None = None) -> None:
+        """Send a push notification through ntfy (best-effort, never raises).
+
+        ``level`` is one of ``info | success | warning | error``. Without a
+        configured channel (or without the ``src.ntfy`` module) this is a
+        silent no-op, so it is always safe to call.
+        """
+        if not (_HAS_NTFY and self.ntfy_channel):
+            return
+        senders = {
+            "info": notify_info,
+            "success": notify_success,
+            "warning": notify_warning,
+            "error": notify_error,
+        }
+        fn = senders.get(level)
+        if fn is None:
+            logger.warning("[NTFY] Nivel de notificacion desconocido: %r", level)
+            return
+        try:
+            if title is not None:
+                fn(message, channel=self.ntfy_channel, title=title)
+            else:
+                fn(message, channel=self.ntfy_channel)
+        except Exception as exc:
+            # Paranoia: a notification must never kill the batch.
+            logger.warning("[NTFY] Fallo enviando notificacion: %s", exc)
 
     def _resolve_log_path(self) -> Path:
         """Resolve the path for the batch CSV log file."""
@@ -349,6 +566,13 @@ class SingleSubjectCDHSABatchRunner:
         logger.info("  Subjects (S)    : %d", n_subjects)
         if ids:
             logger.info("  Subject range   : %d..%d", ids[0], ids[-1])
+        if self.test_subject_ids is not None:
+            logger.info("  [v6] SPLIT TRAIN/TEST:")
+            logger.info("    Train         : %d sujetos (%d..%d)",
+                        n_subjects, ids[0], ids[-1])
+            logger.info("    Test          : %d sujetos (%d..%d)",
+                        len(self.test_subject_ids),
+                        self.test_subject_ids[0], self.test_subject_ids[-1])
         logger.info("  Sessions        : %s", self.params["sessions"])
         logger.info("  Tasks (C)       : %s", self.params["tasks"])
         if tw:
@@ -360,13 +584,38 @@ class SingleSubjectCDHSABatchRunner:
         logger.info("    hankel_depth   : %s", cdhsa.get("hankel_depth", "auto"))
         logger.info("    l_freq-h_freq  : %.1f-%.1f Hz",
                     cdhsa.get("l_freq", 1.0), cdhsa.get("h_freq", 40.0))
-        logger.info("    fixed_rank     : %d", cdhsa.get("fixed_rank", 10))
         logger.info("    rank_method    : %s", cdhsa.get("rank_method", "fixed"))
-        logger.info("    a6_n_null      : %d", cdhsa.get("a6_n_null", 100))
+        if cdhsa.get("rank_method") == "variance":
+            logger.info("    var_explained  : %.2f (cap=%d, piso=%d)",
+                        cdhsa.get("var_explained", 0.99),
+                        cdhsa.get("var_max_rank", 50),
+                        cdhsa.get("var_min_rank", 1))
+        else:
+            logger.info("    fixed_rank     : %d", cdhsa.get("fixed_rank", 10))
+        logger.info("    max_common     : %d", cdhsa.get("max_common", 30))
+        logger.info("    a6_n_null      : %d (tipo %s)",
+                    cdhsa.get("a6_n_null", 100),
+                    cdhsa.get("a6_null_type", "haar"))
         logger.info("    bc_n_perm      : %d", cdhsa.get("bc_n_perm", 5000))
-        logger.info("    skip_bc        : %s", cdhsa.get("skip_bc", False))
-        logger.info("    skip_tangent   : %s", cdhsa.get("skip_tangent", False))
-        logger.info("    skip_d         : %s", cdhsa.get("skip_d", False))
+        logger.info("    d_max_specific : %d (adaptive=%s, loso=%s)",
+                    cdhsa.get("d_max_specific", 10),
+                    cdhsa.get("d_rank_adaptive", False),
+                    cdhsa.get("d_loso", False))
+        logger.info("    replica        : %s",
+                    cdhsa.get("run_replica_consistency", False))
+        logger.info("  ---")
+        if self.classification_enabled:
+            clf = self.classification_cfg
+            logger.info("  [v6] CLASIFICACION (hold-out): ACTIVA")
+            logger.info("    metodo         : %s", clf.get("method", "energy"))
+            logger.info("    rank_truncation : %s",
+                        clf.get("rank_truncation", "min"))
+            logger.info("    n_perm         : %d | seed %d",
+                        clf.get("n_perm", 10000), clf.get("seed", 20261006))
+            logger.info("    plots          : %s",
+                        clf.get("make_plots", True))
+        else:
+            logger.info("  [v6] Clasificacion: inactiva")
         logger.info("  ---")
         logger.info("  Total jobs      : %d (%d sessions)", len(self.all_jobs), n_sessions)
         logger.info("  Delay           : %.1f s", self.delay)
@@ -411,11 +660,48 @@ class SingleSubjectCDHSABatchRunner:
             logger.warning("No se pudo guardar checkpoint: %s", exc)
 
     @staticmethod
+    def _rank_tag(cdhsa: dict) -> str:
+        """Etiqueta de rango para rutas/checkpoints (sincronizada con
+        ``run_cdhsa._rank_tag`` y con ``run_cdhsa_single_subject``)."""
+        if cdhsa.get("rank_method") == "variance":
+            return (f"var{round(float(cdhsa.get('var_explained', 0.99)) * 100)}"
+                    f"c{int(cdhsa.get('var_max_rank', 50))}")
+        if cdhsa.get("rank_method") == "reproducibility":
+            return "repro"
+        return f"fr{int(cdhsa.get('fixed_rank', 10))}"
+
+    @staticmethod
     def _checkpoint_key(job: dict) -> str:
-        """Build a unique checkpoint key from a job dict."""
+        """Build a unique checkpoint key from a job dict.
+
+        v6: la clave incluye los tokens que cambian las salidas (L,
+        esquema de rango, max_common, a6/bc), de modo que cambiar el
+        JSON re-entrena en lugar de colisionar con corridas viejas.
+        """
         tasks_str = "+".join(job["tasks"])
+        cdhsa = job["cdhsa_params"]
+        ranktag = SingleSubjectCDHSABatchRunner._rank_tag(cdhsa)
         return (f"singlesub_n{job['n_subjects']}|{job['session']}|"
-                f"{tasks_str}|{job['t_start']}|{job['t_end']}")
+                f"{tasks_str}|{job['t_start']}|{job['t_end']}"
+                f"|L{cdhsa['L']}|{ranktag}"
+                f"|mc{int(cdhsa.get('max_common', 30))}"
+                f"|a6n{int(cdhsa.get('a6_n_null', 100))}"
+                f"|bcn{int(cdhsa.get('bc_n_perm', 5000))}")
+
+    @staticmethod
+    def _classification_checkpoint_key(params: dict, session: str) -> str:
+        """Clave de checkpoint de la fase de clasificacion."""
+        clf = params.get("classification", {})
+        tw = params.get("time_window", {})
+        tasks_str = "+".join(params["tasks"])
+        _train_ids, test_ids = _resolve_split_subjects(params)
+        n_test = len(test_ids) if test_ids else 0
+        suffix = "" if clf.get("rank_truncation", "min") == "min" \
+            else f"_d{clf.get('rank_truncation')}"
+        return (f"classify|{session}|{tasks_str}"
+                f"|{clf.get('method', 'energy')}{suffix}"
+                f"|{tw.get('t_start')}|{tw.get('t_end')}"
+                f"|nTest{n_test}")
 
     # ------------------------------------------------------------------
     # CSV log
@@ -439,6 +725,7 @@ class SingleSubjectCDHSABatchRunner:
                 writer.writerow({
                     "timestamp": datetime.now().isoformat(),
                     "mode": job.get("mode", "single_subject"),
+                    "phase": job.get("phase", "train"),
                     "subjects": _subjects_label(job),
                     "session": job["session"],
                     "tasks": "+".join(job["tasks"]),
@@ -483,7 +770,8 @@ class SingleSubjectCDHSABatchRunner:
         """Build the subprocess command for a single-subject CD-HSA job.
 
         Always uses ``--subject-ids i1 i2 ...`` (S=n_subjects, all
-        individual subjects together).
+        individual subjects together).  v6: pasa TODOS los parametros
+        v5.1 del bloque cdhsa_params.
         """
         cdhsa = job["cdhsa_params"]
 
@@ -505,17 +793,50 @@ class SingleSubjectCDHSABatchRunner:
         if job["t_end"] != "None":
             cmd.extend(["--t-end", job["t_end"]])
 
-        # CD-HSA parameters
+        # CD-HSA parameters (v5.1 parity)
         cmd.extend([
             "--L", str(cdhsa["L"]),
             "--l-freq", str(cdhsa.get("l_freq", 1.0)),
             "--h-freq", str(cdhsa.get("h_freq", 40.0)),
-            "--fixed-rank", str(cdhsa.get("fixed_rank", 10)),
             "--rank-method", str(cdhsa.get("rank_method", "fixed")),
+            "--fixed-rank", str(cdhsa.get("fixed_rank", 10)),
+            "--max-common", str(cdhsa.get("max_common", 30)),
             "--a6-n-null", str(cdhsa.get("a6_n_null", 100)),
             "--bc-n-perm", str(cdhsa.get("bc_n_perm", 5000)),
             "--d-max-specific", str(cdhsa.get("d_max_specific", 10)),
+            "--seed", str(cdhsa.get("seed", 42)),
         ])
+        if cdhsa.get("rank_method") == "variance":
+            cmd.extend([
+                "--var-explained", str(cdhsa.get("var_explained", 0.99)),
+                "--var-max-rank", str(cdhsa.get("var_max_rank", 50)),
+                "--var-min-rank", str(cdhsa.get("var_min_rank", 1)),
+            ])
+        if cdhsa.get("a6_max_common") is not None:
+            cmd.extend(["--a6-max-common", str(cdhsa["a6_max_common"])])
+        if cdhsa.get("a6_null_type"):
+            cmd.extend(["--a6-null-type", str(cdhsa["a6_null_type"])])
+        if cdhsa.get("a6_hankel_row_block"):
+            cmd.extend(["--a6-hankel-row-block",
+                        str(cdhsa["a6_hankel_row_block"])])
+        if cdhsa.get("rank_outcome"):
+            cmd.extend(["--rank-outcome", str(cdhsa["rank_outcome"])])
+        if cdhsa.get("tangent_blocks_mode"):
+            cmd.extend(["--tangent-blocks-mode",
+                        str(cdhsa["tangent_blocks_mode"])])
+        if cdhsa.get("d_rank_adaptive", False):
+            cmd.append("--d-rank-adaptive")
+        if cdhsa.get("d_n_null_specific") is not None:
+            cmd.extend(["--d-n-null-specific",
+                        str(cdhsa["d_n_null_specific"])])
+        if cdhsa.get("d_loso", False):
+            cmd.append("--d-loso")
+        if cdhsa.get("d_loso_n_perm") is not None:
+            cmd.extend(["--d-loso-n-perm", str(cdhsa["d_loso_n_perm"])])
+        if cdhsa.get("run_replica_consistency", False):
+            cmd.append("--run-replica-consistency")
+        if cdhsa.get("effective_rank", False):
+            cmd.append("--effective-rank")
 
         # Optional hankel depth
         if cdhsa.get("hankel_depth") is not None:
@@ -545,7 +866,8 @@ class SingleSubjectCDHSABatchRunner:
         """Return the directory where the pipeline saves results.
 
         Mirrors the path scheme in ``run_cdhsa_single_subject.py``'s
-        ``_resolve_out_dir()``, using the ``nSub{N}`` label.
+        ``_resolve_out_dir()`` (v5.1: etiqueta de rango ``var{X}c{cap}``
+        / ``repro`` / ``fr{n}``).
         """
         if not self.output_dir:
             return Path(".")
@@ -558,19 +880,18 @@ class SingleSubjectCDHSABatchRunner:
         t_end_tag = (f"{tw['t_end']}s" if tw["t_end"] != "None" else "any")
 
         L = cdhsa["L"]
-        fr = cdhsa.get("fixed_rank", 10)
         a6n = cdhsa.get("a6_n_null", 100)
         bcn = cdhsa.get("bc_n_perm", 5000)
         l_freq = cdhsa.get("l_freq", 1.0)
         h_freq = cdhsa.get("h_freq", 40.0)
         depth = cdhsa.get("hankel_depth") or "auto"
 
+        rtag = self._rank_tag(cdhsa)
         subj_label = f"nSub{job['n_subjects']}"
 
         out_dir = Path(
             f"{self.output_dir}/cdhsa/{job['session']}"
-            f"/{subj_label}_L{L}"
-            f"_fr{fr}_a6n{a6n}_bcn{bcn}"
+            f"/{subj_label}_L{L}_{rtag}_a6n{a6n}_bcn{bcn}"
             f"/{l_freq}-{h_freq}Hz"
             f"_depth{depth}"
             f"/from{t_start_tag}_to{t_end_tag}"
@@ -695,6 +1016,11 @@ class SingleSubjectCDHSABatchRunner:
                 "Error construyendo comando para %s/%s: %s",
                 _subjects_label(job), job["session"], exc,
             )
+            self._notify(
+                "error",
+                f"Fallo construyendo comando de {job['session']}: "
+                f"{exc}",
+                title="[CD-HSA] Error de configuracion")
             return key, False
 
         label = _subjects_label(job)
@@ -779,6 +1105,11 @@ class SingleSubjectCDHSABatchRunner:
                     label, job["session"],
                     proc.returncode,
                 )
+                self._notify(
+                    "error",
+                    f"Job CD-HSA {label}/{job['session']} FALLO "
+                    f"(codigo {proc.returncode}); el batch continua.",
+                    title="[CD-HSA] Fallo de job")
 
             # [MEM TRACKING] Checkpoint after job
             if _HAS_MEM_TRACKER:
@@ -795,10 +1126,239 @@ class SingleSubjectCDHSABatchRunner:
                 "EXCEPTION | %s/%s: %s",
                 label, job["session"], exc,
             )
+            self._notify(
+                "error",
+                f"Excepcion en job {label}/{job['session']}: {exc}",
+                title="[CD-HSA] Excepcion en job")
             self._write_csv_log(
                 job, False, -1, elapsed, cmd_for_log,
             )
             return key, False
+
+    # ------------------------------------------------------------------
+    # [v6] Classification phase (hold-out)
+    # ------------------------------------------------------------------
+
+    def _classification_out_dir(self, job: dict) -> Path | None:
+        """Directorio de salida de la fase de clasificacion."""
+        if not self.output_dir:
+            return None
+        clf = self.classification_cfg
+        method_tag = str(clf.get("method", "energy"))
+        rank_tr = clf.get("rank_truncation", "min")
+        suffix = "" if rank_tr == "min" else f"_d{rank_tr}"
+        t0 = job["t_start"] if job["t_start"] != "None" else "any"
+        t1 = job["t_end"] if job["t_end"] != "None" else "any"
+        return Path(
+            f"{self.output_dir}/cdhsa_classification/{job['session']}"
+            f"/{method_tag}{suffix}"
+            f"/from{t0}s_to{t1}s_{'_'.join(job['tasks'])}")
+
+    def _build_classification_command(self, job: dict,
+                                      train_out: Path) -> list[str]:
+        """Comando del pipeline de clasificacion para un job de train."""
+        clf = self.classification_cfg
+        cmd = [
+            sys.executable, "-m", self.classification_module,
+            "--train-results-dir", str(train_out),
+            "--session", job["session"],
+            "--subject-ids",
+        ] + [str(i) for i in self.test_subject_ids] + [
+            "--tasks",
+        ] + list(job["tasks"])
+
+        if job["t_start"] != "None":
+            cmd.extend(["--t-start", job["t_start"]])
+        if job["t_end"] != "None":
+            cmd.extend(["--t-end", job["t_end"]])
+
+        cmd.extend([
+            "--method", str(clf.get("method", "energy")),
+            "--rank-truncation", str(clf.get("rank_truncation", "min")),
+            "--n-perm", str(clf.get("n_perm", 10000)),
+            "--seed", str(clf.get("seed", 20261006)),
+        ])
+        if not clf.get("make_plots", True):
+            cmd.append("--skip-plots")
+
+        if self.db_path:
+            cmd.extend(["--db-path", self.db_path])
+        out_dir = self._classification_out_dir(job)
+        if out_dir is not None:
+            cmd.extend(["--out-dir", str(out_dir)])
+        return cmd
+
+    def _run_classification_job(self, job: dict, train_out: Path) -> bool:
+        """Ejecutar (con polling RSS y log) el pipeline de clasificacion."""
+        try:
+            cmd = self._build_classification_command(job, train_out)
+        except Exception as exc:
+            logger.error("Error construyendo comando de clasificacion: %s",
+                         exc)
+            self._notify(
+                "error", f"Fallo construyendo comando de clasificacion: "
+                         f"{exc}", title="[CD-HSA] Clasificacion FALLO")
+            return False
+
+        out_dir = self._classification_out_dir(job)
+        label = "classify/%s" % job["session"]
+        logger.info(
+            "RUN | %s | test=%d sujetos | train=%s",
+            label, len(self.test_subject_ids), train_out,
+        )
+        logger.debug("CMD: %s", " ".join(cmd))
+
+        clf_job = {
+            "mode": "classification",
+            "phase": "classify",
+            "subject_ids": self.test_subject_ids,
+            "n_subjects": len(self.test_subject_ids),
+            "session": job["session"],
+            "tasks": job["tasks"],
+            "cdhsa_params": job["cdhsa_params"],
+            "t_start": job["t_start"],
+            "t_end": job["t_end"],
+        }
+
+        t0 = time.time()
+        cmd_for_log = cmd
+        try:
+            child_env = os.environ.copy()
+            child_env["PYTHONUNBUFFERED"] = "1"
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, env=child_env,
+            )
+
+            _child_peak = [0.0]
+            _child_samples: list[tuple[float, float]] = []
+
+            def _poll_thread():
+                pk, samps = self._poll_child_rss(proc)
+                _child_peak[0] = pk
+                _child_samples.extend(samps)
+
+            _thr = threading.Thread(target=_poll_thread, daemon=True)
+            _thr.start()
+
+            for line in proc.stdout:
+                logger.info("  [CLF] %s", line.rstrip())
+
+            proc.wait()
+            _thr.join(timeout=3.0)
+
+            elapsed = time.time() - t0
+            success = proc.returncode == 0
+            peak_mb = _child_peak[0]
+
+            self._job_memory_stats.append({
+                "label": label,
+                "session": job["session"],
+                "success": success,
+                "elapsed_s": round(elapsed, 2),
+                "peak_rss_mb": round(peak_mb, 1),
+                "n_rss_samples": len(_child_samples),
+            })
+            self._write_csv_log(clf_job, success, proc.returncode, elapsed,
+                                cmd)
+
+            if success:
+                logger.info(
+                    "OK | %s (%.1f s, peak %.1f MB)",
+                    label, elapsed, peak_mb,
+                )
+                # Extraer el resumen de accuracy del results.json
+                if out_dir is not None:
+                    self._read_classification_summary(out_dir, job)
+            else:
+                logger.error("ERROR | %s -- codigo %d", label,
+                             proc.returncode)
+                self._notify(
+                    "error",
+                    f"Clasificacion {job['session']} FALLO "
+                    f"(codigo {proc.returncode}).",
+                    title="[CD-HSA] Clasificacion FALLO")
+            return success
+
+        except Exception as exc:
+            elapsed = time.time() - t0
+            logger.error("EXCEPTION | %s: %s", label, exc)
+            self._notify(
+                "error", f"Excepcion en clasificacion: {exc}",
+                title="[CD-HSA] Clasificacion FALLO")
+            self._write_csv_log(clf_job, False, -1, elapsed, cmd_for_log)
+            return False
+
+    def _read_classification_summary(self, out_dir: Path, job: dict) -> None:
+        """Leer accuracy del results.json para log + notificacion final."""
+        try:
+            results_path = Path(out_dir) / "classification_results.json"
+            with open(results_path, "r", encoding="utf-8") as fh:
+                res = json.load(fh)
+            parts = []
+            for meth, m in res.get("metrics", {}).items():
+                if not m:
+                    continue
+                parts.append(
+                    f"{meth}: {m['n_correct']}/{m['n_test']} "
+                    f"({m['accuracy'] * 100:.1f}%)")
+            if parts:
+                summary = (f"{job['session']} ({'+'.join(job['tasks'])}): "
+                           + " | ".join(parts))
+                self._classification_summaries.append(summary)
+                self._notify(
+                    "success",
+                    "Clasificacion hold-out terminada: " + summary,
+                    title="[CD-HSA] Resultado de clasificacion")
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            logger.warning("No se pudo leer el resumen de clasificacion: %s",
+                           exc)
+
+    def _run_classification_phase(self) -> bool:
+        """Fase v6: clasificacion hold-out de los sujetos TEST."""
+        if not self.classification_enabled:
+            return True
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("  FASE DE CLASIFICACION (hold-out, %d sujetos test)",
+                    len(self.test_subject_ids))
+        logger.info("=" * 70)
+
+        all_ok = True
+        for job in self.all_jobs:
+            session = job["session"]
+            key = self._classification_checkpoint_key(self.params, session)
+            if key in self.checkpoint:
+                logger.info(
+                    "SKIP (checkpoint): clasificacion %s ya completada",
+                    session)
+                # Recuperar el resumen si existe en disco
+                out_dir = self._classification_out_dir(job)
+                if out_dir is not None and not self._classification_summaries:
+                    self._read_classification_summary(out_dir, job)
+                continue
+
+            train_out = self._get_output_dir(job)
+            if not (train_out / "cdhsa_arrays.npz").exists():
+                logger.error(
+                    "Sin resultados de entrenamiento en %s: fase de "
+                    "clasificacion BLOQUEADA para %s", train_out, session)
+                self._notify(
+                    "error",
+                    f"Clasificacion {session} bloqueada: no hay "
+                    f"resultados de train en {train_out}.",
+                    title="[CD-HSA] Clasificacion bloqueada")
+                all_ok = False
+                continue
+
+            ok = self._run_classification_job(job, train_out)
+            if ok:
+                self.checkpoint.add(key)
+                self._save_checkpoint()
+            else:
+                all_ok = False
+        return all_ok
 
     # ------------------------------------------------------------------
     # Post-processing: extract mode indices JSON
@@ -964,6 +1524,22 @@ class SingleSubjectCDHSABatchRunner:
             logger.error("No se generaron jobs. Revisa el JSON de parametros.")
             return 1
 
+        # [NTFY] Canary de arranque
+        t_batch_start = time.time()
+        label = self.params.get("experiment_label", "batch_cdhsa_ss")
+        try:
+            import socket
+            host = socket.gethostname()
+        except Exception:
+            host = "(host desconocido)"
+        plan = (f"Experimento {label} | S={self.all_jobs[0]['n_subjects']} "
+                f"train")
+        if self.classification_enabled:
+            plan += (f" + {len(self.test_subject_ids)} test (clasificacion)"
+                     f" | tareas {' + '.join(self.params['tasks'])}")
+        self._notify("info", plan + f" | host {host}",
+                     title="[CD-HSA] Batch single-subject iniciado")
+
         todo = self._filter_todo(self.all_jobs)
         total = len(todo)
 
@@ -975,7 +1551,8 @@ class SingleSubjectCDHSABatchRunner:
                     "run_comparison=true: NO APLICA en modo single-subject "
                     "(un solo pool de sujetos por sesion; nada que comparar)."
                 )
-            return 0
+            clf_ok = self._run_classification_phase()
+            return self._final_summary(0, 0, 0, clf_ok, t_batch_start)
 
         logger.info("Total a ejecutar: %d / %d", total, len(self.all_jobs))
 
@@ -1004,7 +1581,49 @@ class SingleSubjectCDHSABatchRunner:
                 "(un solo pool de sujetos por sesion; nada que comparar)."
             )
 
-        return 0 if failed == 0 else 1
+        clf_ok = self._run_classification_phase()
+        return self._final_summary(completed, failed, total, clf_ok,
+                                   t_batch_start)
+
+    def _final_summary(self, completed: int, failed: int, total: int,
+                       clf_ok: bool, t_batch_start: float) -> int:
+        """Log + notificacion final del batch (incluye accuracy si hubo)."""
+        rc = 0 if (failed == 0 and clf_ok) else 1
+        duration = time.time() - t_batch_start
+        try:
+            import socket
+            host = socket.gethostname()
+        except Exception:
+            host = "(host desconocido)"
+
+        if self._classification_summaries:
+            logger.info("")
+            logger.info("=" * 70)
+            logger.info("  RESUMEN DE CLASIFICACION (hold-out)")
+            for s in self._classification_summaries:
+                logger.info("  %s", s)
+            logger.info("=" * 70)
+
+        msg_lines = [
+            f"Duracion total: {duration / 3600.0:.2f} h ({duration:.0f} s)",
+            f"Host: {host}",
+            f"Train: OK {completed} / Fallos {failed} (total {total})",
+        ]
+        if self.classification_enabled:
+            msg_lines.append(
+                "Clasificacion: " + ("OK" if clf_ok else "FALLO/BLOQUEADA"))
+            for s in self._classification_summaries:
+                msg_lines.append(f"  {s}")
+        msg_lines.append(f"Salidas: {self.output_dir}")
+        msg = "\n".join(msg_lines)
+
+        if rc == 0:
+            self._notify("success", msg,
+                         title="[CD-HSA] Batch single-subject terminado OK")
+        else:
+            self._notify("warning", msg,
+                         title="[CD-HSA] Batch terminado CON PROBLEMAS")
+        return rc
 
     def _run_sequential(self, todo: list[dict], total: int) -> tuple[int, int]:
         completed = 0
@@ -1071,11 +1690,17 @@ class SingleSubjectCDHSABatchRunner:
 # ===========================================================================
 
 
+@notify_on_critical_error(
+    channel=_NTFY_CHANNEL or None,
+    title="[CD-HSA] ERROR critico del batch single-subject",
+    catch_system_exit=True,
+)
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Batch runner para el pipeline CD-HSA single-subject. "
-            "Lee la configuracion desde un JSON."
+            "Lee la configuracion desde un JSON (esquema legado o v6 "
+            "train/test + clasificacion)."
         ),
     )
     parser.add_argument(
@@ -1092,6 +1717,16 @@ def main() -> int:
             "Default: run_cdhsa_single_subject.py en src/pipelines."
         ),
     )
+    parser.add_argument(
+        "--pipeline-module", type=str, default=None,
+        help="Modulo del pipeline de entrenamiento "
+             "(default: src.pipelines.run_cdhsa_single_subject).",
+    )
+    parser.add_argument(
+        "--classification-module", type=str, default=None,
+        help="Modulo del pipeline de clasificacion "
+             "(default: src.pipelines.run_cdhsa_task_classification).",
+    )
     args = parser.parse_args()
 
     json_path = Path(args.params_json) if args.params_json else DEFAULT_PARAMS_JSON
@@ -1107,7 +1742,12 @@ def main() -> int:
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        runner = SingleSubjectCDHSABatchRunner(params, pipeline_script=pipeline_script)
+        runner = SingleSubjectCDHSABatchRunner(
+            params,
+            pipeline_script=pipeline_script,
+            pipeline_module=args.pipeline_module,
+            classification_module=args.classification_module,
+        )
         return runner.run()
 
 

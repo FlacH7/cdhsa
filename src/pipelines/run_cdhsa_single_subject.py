@@ -28,6 +28,17 @@ Usage (CLI)::::
         --L 10 --hankel-depth 10 \\
         --fixed-rank 20 --a6-n-null 500 --bc-n-perm 5000
 
+    # Rango por varianza explicada (v5): menor r que explica el 95% de
+    # la energia Hankel por grabacion (sujeto), tope de candidatos 200
+    python -m src.pipelines.run_cdhsa_single_subject \\
+        --session session1 \\
+        --n-subjects 60 \\
+        --tasks eyesclosed music \\
+        --t-start 100 --t-end 200 \\
+        --L 10 --hankel-depth 10 \\
+        --rank-method variance --var-explained 0.95 --var-max-rank 200 \\
+        --a6-n-null 200 --bc-n-perm 5000 --d-loso
+
     # Lista explicita de sujetos
     python -m src.pipelines.run_cdhsa_single_subject \\
         --session session1 \\
@@ -64,6 +75,7 @@ import mne
 
 from src.pipelines.run_cdhsa import (
     CDHSAConfig,
+    _rank_tag,
     characterize_hankel_matrices,
     save_results,
 )
@@ -433,18 +445,85 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
 
     # --- Config CDHSA ---
+    # (espejo del grupo de run_cdhsa._parse_args, SIN --no-boundary-mask:
+    # en modo single-subject cada X[s][c] es la Hankel de UN sujeto, no hay
+    # concatenacion temporal de miembros y por tanto no existen fronteras
+    # de nivel 2 que enmascarar)
     g = parser.add_argument_group("Parametros CDHSA")
     g.add_argument("--fixed-rank", type=int, default=10)
     g.add_argument("--rank-method", type=str, default="fixed",
-                   choices=["fixed", "reproducibility"])
+                   choices=["fixed", "reproducibility", "variance"],
+                   help="Metodo de seleccion del rango local. "
+                        "'variance': menor r que explica --var-explained "
+                        "de la energia Hankel (por grabacion; revive el "
+                        "test de rango del Step B).")
+    g.add_argument("--var-explained", type=float, default=0.99,
+                   help="Fraccion de varianza para rank-method=variance "
+                        "(X%%, p.ej. 0.99). Default: 0.99")
+    g.add_argument("--var-max-rank", type=int, default=50,
+                   help="Tope de candidatos para rank-method=variance. "
+                        "Default: 50")
+    g.add_argument("--var-min-rank", type=int, default=1,
+                   help="Piso de rango local para rank-method=variance. "
+                        "Default: 1")
+    g.add_argument("--max-common", type=int, default=30,
+                   help="Tope del pool de candidatos comunes de A1-A5 "
+                        "(dimension de W, el candidato maximo de r0). "
+                        "Default: 30. Si A6 acepta TODOS los candidatos "
+                        "(r0 = max_common), el backbone esta censurado: "
+                        "subalo junto con var_max_rank.")
     g.add_argument("--a6-n-null", type=int, default=100)
+    g.add_argument("--a6-max-common", type=int, default=0,
+                   help="Candidatos a testear en A6. 0 = todos los de "
+                        "A1-A5 (evita censurar r0).")
+    g.add_argument("--a6-null-type", type=str, default="haar",
+                   choices=["haar", "hankel"],
+                   help="Nulo del criterio dual. 'hankel' = rotacion "
+                        "de canales que preserva la estructura de "
+                        "retardo (Seccion 7 del paper; mas caro).")
+    g.add_argument("--a6-hankel-row-block", type=int, default=0,
+                   help="Filas de X por canal para el nulo hankel "
+                        "(= hankel_depth del primer nivel; el pipeline "
+                        "lo autodetecta desde la info de construccion).")
     g.add_argument("--bc-n-perm", type=int, default=5000)
+    g.add_argument("--effective-rank", action="store_true",
+                   help="Calcular ademas un rango efectivo X%% por "
+                        "grabacion (A1-A5) y guardarlo en "
+                        "R['rank_effective']; habilita --rank-outcome "
+                        "effective para el test de rango (Remark 3.6).")
+    g.add_argument("--rank-outcome", type=str, default="selected",
+                   choices=["selected", "effective"],
+                   help="Resultado del test de rango del Step B: el rango "
+                        "primario ('selected') o el efectivo X%% "
+                        "('effective'; requiere --effective-rank).")
+    g.add_argument("--tangent-blocks-mode", type=str, default="cumulative",
+                   choices=["omnibus", "cumulative"],
+                   help="Bloques del test tangente: 'cumulative' = "
+                        "B_k={1..k}, k=1..min(r0, r) con max-T sobre "
+                        "la familia (paper 3.4, default); 'omnibus' = "
+                        "un solo bloque {1..r0}.")
     g.add_argument("--d-max-specific", type=int, default=10,
                    help="Maximos modos especificos por condicion (Step D). "
                    "Default: 10")
+    g.add_argument("--d-rank-adaptive", action="store_true",
+                   help="Seleccionar r_c por test Haar consecutivo (Def. "
+                        "3.13) en vez del tope fijo.")
+    g.add_argument("--d-n-null-specific", type=int, default=100,
+                   help="Replicas del nulo Haar de Step D. Default: 100")
+    g.add_argument("--d-alpha-specific", type=float, default=0.05)
+    g.add_argument("--d-loso", action="store_true",
+                   help="Calibracion LOSO del contraste de prevalencia "
+                        "(Def. 3.15 del paper).")
+    g.add_argument("--d-loso-n-perm", type=int, default=1000,
+                   help="Permutaciones del nulo LOSO. Default: 1000")
+    g.add_argument("--run-replica-consistency", action="store_true",
+                   help="Consistencia por replica (Framework 2, Seccion "
+                        "4.5 del paper, criterio >=4/5).")
     g.add_argument("--skip-bc", action="store_true")
     g.add_argument("--skip-tangent", action="store_true")
     g.add_argument("--skip-d", action="store_true")
+    g.add_argument("--seed", type=int, default=42,
+                   help="Semilla global del experimento. Default: 42")
 
     parser.add_argument("--verbose", action="store_true", default=True)
     parser.add_argument(
@@ -468,9 +547,13 @@ def _resolve_out_dir(args: argparse.Namespace) -> Path:
     Estructura::
 
         {BASE_RESULTS_PATH}/cdhsa/{session}/
-            nSub{N}_L{L}_fr{fr}_a6n{a6}_bcn{bc}/
+            nSub{N}_L{L}_{ranktag}_a6n{a6}_bcn{bc}/
             {l_freq}-{h_freq}Hz_depth{d}/
             from{t0}s_to{t1}s_{tasks}
+
+    donde ``ranktag = _rank_tag(rank_method, fixed_rank, var_explained,
+    var_max_rank)``: ``var95c200`` para rank-method=variance, ``repro``
+    para reproducibility, o ``fr20`` para fixed.
     """
     base = args.out_dir
     if base is None:
@@ -493,10 +576,13 @@ def _resolve_out_dir(args: argparse.Namespace) -> Path:
 
     subj_label = f"nSub{n_subjects}"
 
+    rtag = _rank_tag(args.rank_method, args.fixed_rank,
+                     args.var_explained, args.var_max_rank)
+
     out_dir = Path(
         f"{base}/cdhsa/{args.session}"
         f"/{subj_label}_L{args.L}"
-        f"_fr{args.fixed_rank}_a6n{args.a6_n_null}_bcn{args.bc_n_perm}"
+        f"_{rtag}_a6n{args.a6_n_null}_bcn{args.bc_n_perm}"
         f"/{args.l_freq}-{args.h_freq}Hz"
         f"_depth{args.hankel_depth or 'auto'}"
         f"/from{t_start_tag}_to{t_end_tag}"
@@ -556,14 +642,48 @@ def main(argv: list[str] | None = None) -> int:
     cfg = CDHSAConfig(
         fixed_rank=args.fixed_rank,
         rank_method=args.rank_method,
+        var_explained=args.var_explained,
+        var_max_rank=args.var_max_rank,
+        var_min_rank=args.var_min_rank,
+        max_common=args.max_common,
         a6_n_null=args.a6_n_null,
+        a6_max_common=args.a6_max_common,
+        a6_null_type=args.a6_null_type,
+        a6_hankel_row_block=args.a6_hankel_row_block,
         bc_n_perm=args.bc_n_perm,
         bc_condition_names=list(args.tasks),
+        bc_rank_outcome=args.rank_outcome,
+        effective_rank=args.effective_rank,
+        tangent_blocks_mode=args.tangent_blocks_mode,
         d_max_specific=args.d_max_specific,
+        d_rank_adaptive=args.d_rank_adaptive,
+        d_n_null_specific=args.d_n_null_specific,
+        d_alpha_specific=args.d_alpha_specific,
+        d_loso=args.d_loso,
+        d_loso_n_perm=args.d_loso_n_perm,
+        run_replica_consistency=args.run_replica_consistency,
         skip_bc=args.skip_bc,
         skip_tangent=args.skip_tangent,
         skip_d=args.skip_d,
+        seed=args.seed,
     )
+
+    # Nulo Hankel-preservante: autodetectar las filas de X por canal
+    # (= depth del primer nivel, layout canal-major de la Hankel de
+    # _build_multivariate_hankel) para la rotacion I_{L1} (x) Q fiel al
+    # paper (Seccion 7). Las Hankels de nivel 1 de este pipeline usan
+    # el MISMO layout canal-major que las de run_cdhsa.
+    if cfg.a6_null_type == 'hankel' and cfg.a6_hankel_row_block == 0:
+        depth_common = hankel_info.get('depth_common')
+        if depth_common:
+            cfg.a6_hankel_row_block = int(depth_common)
+            print(f"  [a6-null=hankel] row_block autodetectado: "
+                  f"{cfg.a6_hankel_row_block} (canales: "
+                  f"{hankel_info.get('n_channels_common')})")
+        else:
+            print("  [WARN] a6-null-type=hankel sin row_block: no se pudo "
+                  "autodetectar el depth del primer nivel; se usara "
+                  "rotacion densa (legacy).")
 
     S = len(X)
     print("\n" + "=" * 70)
@@ -572,15 +692,36 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Modo                  : single-subject")
     print(f"  Sujetos (S)           : {S}")
     print(f"  Condiciones (C)       : {len(args.tasks)}")
-    print(f"  L (subespacio)        : {args.L}")
-    print(f"  fixed_rank            : {cfg.fixed_rank}")
-    print(f"  a6_n_null             : {cfg.a6_n_null}")
+    print(f"  L (embedding nivel 2) : {args.L}")
+    if cfg.rank_method == 'variance':
+        print(f"  rank_method           : variance (X={cfg.var_explained*100:.1f}%, "
+              f"cap={cfg.var_max_rank}, piso={cfg.var_min_rank})")
+    else:
+        print(f"  rank_method           : {cfg.rank_method}")
+        print(f"  fixed_rank            : {cfg.fixed_rank}")
+    print(f"  max_common            : {cfg.max_common}")
+    if cfg.effective_rank:
+        print(f"  Rango efectivo X%     : ON (rank_outcome={cfg.bc_rank_outcome})")
+    print(f"  a6_n_null             : {cfg.a6_n_null} (null={cfg.a6_null_type})")
     print(f"  bc_n_perm             : {cfg.bc_n_perm}")
+    print(f"  tangent_blocks        : {cfg.tangent_blocks_mode}")
+    print(f"  d_max_specific       : {cfg.d_max_specific} "
+          f"(adaptive={cfg.d_rank_adaptive}, loso={cfg.d_loso})")
+    if cfg.run_replica_consistency:
+        print(f"  replica_consistency  : True (>=4/5)")
+    print(f"  seed                  : {cfg.seed}")
     if out_dir is not None:
         print(f"  Out dir               : {out_dir}")
     print("")
     sys.stdout.flush()
 
+    # NOTA: no se pasan mascaras de fronteras de nivel 2 (col_masks=None).
+    # En este pipeline cada X[s][c] es la Hankel de UN solo sujeto (sin
+    # concatenacion temporal de miembros), por lo que no existen
+    # fronteras de concatenacion dentro de una grabacion y no hay
+    # columnas de nivel 2 que descartar (ver
+    # run_cdhsa._compute_col_masks: una grabacion con un solo miembro
+    # no tiene fronteras internas).
     result = run_cdhsa(X, args.L, cfg)
 
     # 4. Resultados

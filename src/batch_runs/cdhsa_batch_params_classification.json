@@ -1,0 +1,110 @@
+{
+  "experiment_label": "classification_40train_20test_eyesclosed_vs_memory",
+
+  "_comment_experiment": [
+    "Experimento de clasificacion hold-out (v6).",
+    "FASE 1 (train): CD-HSA sobre sujetos INDIVIDUALES (S=40, C=2:",
+    "eyesclosed vs memory) con el esquema de parametros v5.1 (rango por",
+    "varianza explicada, Step D adaptativo con nulo Haar, LOSO).",
+    "FASE 2 (test): las 40 grabaciones de los 20 sujetos restantes",
+    "(41..60, ambas tareas) se clasifican de forma independiente",
+    "proyectando su Hankel de nivel 2 sobre los subespacios especificos",
+    "W_c aprendidos en la fase train. Salidas: accuracy total y por",
+    "tarea, matriz de confusion, p-valores (binomial exacto y",
+    "permutacion pareada por sujeto), AUC y ~10 graficos.",
+    "Cada grabacion se clasifica por separado: ambas tareas del mismo",
+    "sujeto pueden recibir la misma etiqueta si el metodo lo decide."
+  ],
+
+  "subjects": {
+    "train": {
+      "n_subjects": 40,
+      "subject_start_offset": 1,
+      "_comment": "Sujetos 1..40 (entrenamiento CD-HSA)."
+    },
+    "test": {
+      "n_subjects": 20,
+      "subject_start_offset": 41,
+      "_comment": "Sujetos 41..60 (hold-out; NUNCA vistos en el train)."
+    }
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "memory"],
+
+  "time_window": {
+    "t_start": 100.0,
+    "t_end": 200.0,
+    "_comment": "Ventana temporal POR SUJETO (segundos), identica a la de los experimentos multi-SS."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+
+    "rank_method": "variance",
+    "var_explained": 0.95,
+    "var_max_rank": 200,
+    "var_min_rank": 1,
+    "max_common": 100,
+
+    "a6_n_null": 200,
+    "a6_max_common": 0,
+    "a6_null_type": "haar",
+
+    "bc_n_perm": 5000,
+
+    "tangent_blocks_mode": "cumulative",
+
+    "d_max_specific": 64,
+    "d_rank_adaptive": true,
+    "d_n_null_specific": 200,
+    "d_loso": true,
+    "d_loso_n_perm": 1000,
+
+    "run_replica_consistency": false,
+
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+
+    "_comment": [
+      "Esquema v5.1 sin censuras (var 95% cap 200, pool 100).",
+      "run_replica_consistency=false: el Framework 2 (replicas) esta",
+      "definido para el diseno super-sujeto; con sujetos individuales",
+      "la unidad de replicacion seria el sujeto (leave-one-out = 40",
+      "recomputaciones del nucleo, fuera de alcance aqui). La",
+      "generalizacion se evalua directamente con el hold-out.",
+      "NOTA: single-subject no lleva --no-boundary-mask porque cada",
+      "grabacion es UN sujeto (no hay fronteras de concatenacion)."
+    ]
+  },
+
+  "classification": {
+    "enabled": true,
+    "method": "energy",
+    "rank_truncation": "min",
+    "n_perm": 10000,
+    "seed": 20261006,
+    "make_plots": true,
+
+    "_comment": [
+      "method: 'energy' (energia residual capturada por W_c a rango",
+      "comun d=min(r_c), recomendado) | 'ml' (regla de Bayes bajo",
+      "covarianza spiked; requiere hankel_matrices.npz del train y",
+      "anade ~1-3 h) | 'both'.",
+      "rank_truncation: 'min' (d = min r_c, comparacion justa entre",
+      "clases) o un entero en [1, min(r_c)]."
+    ]
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4
+  }
+}
