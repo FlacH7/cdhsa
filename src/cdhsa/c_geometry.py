@@ -40,6 +40,8 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
+TANGENT_NULL_SCHEME = 2
+
 
 # ============================================================================
 # Helper: omnibus tangent statistic (UNCHANGED — paper-faithful)
@@ -242,8 +244,17 @@ def cdhsa_tangent_geometry_test(
     2. **Bloques por defecto**: familia acumulada k=1..k_max con
        k_max = min(r0, min r_sc) y corrección max-T sobre la familia
        (antes: un único bloque omnibus {1..r0}).
-    3. Lo que NO cambia: el estadístico T_k, la permutación
-       within-subject y el max-T con (+1)/(n+1).
+
+    (v5.2 — fix 2026-10-15) Corregido el esquema de permutación de la
+    nula: ahora se sortea **una** permutación de etiquetas por sujeto y
+    por réplica, aplicada de forma consistente a **todos** los bloques
+    (antes ``rng.permutation(C)`` se re-evaluaba por `c` y por bloque,
+    produciendo etiquetas duplicadas y un max-T inválido; ver
+    ``TANGENT_NULL_SCHEME``). El estadístico observado ``T_obs`` NO
+    cambia; solo cambian las nulas y los p-values. Con C=2 el p-valor
+    mínimo alcanzable es ~1/2^(S-1) (el estadístico es invariante al
+    swap global de etiquetas, así que la órbita de la asignación
+    identidad tiene 2 elementos).
     """
     if opts is None:
         opts = {}
@@ -299,10 +310,20 @@ def cdhsa_tangent_geometry_test(
         null_maxT = np.zeros(n_perm, dtype=np.float64)
 
         for b in range(n_perm):
+            # [FIX v5.2 — 2026-10-15] UNA permutacion de etiquetas por
+            # sujeto, compartida por TODOS los bloques k de la replica b.
+            # (Version <= v5.1 con bug: ``rng.permutation(C)`` se evaluaba
+            # una vez por c dentro de la comprension -> para C=2 las dos
+            # "etiquetas" eran monedas independientes (~50% de sujetos con
+            # la condicion duplicada), y se re-dibujaba por bloque k ->
+            # max-T sobre re-etiquetados incompatibles. Ver
+            # TANGENT_NULL_SCHEME arriba.)
+            perms = [rng.permutation(C) for _ in range(S)]
             for k in range(Kb):
-                # Permute condition labels within each subject
+                # Permute condition labels within each subject (ONE
+                # permutation per subject, consistent across blocks).
                 L_k = [
-                    [L[s][rng.permutation(C)[c]][k] for c in range(C)]
+                    [L[s][perms[s][c]][k] for c in range(C)]
                     for s in range(S)
                 ]
                 null_T[b, k] = _tangent_stat(L_k)
