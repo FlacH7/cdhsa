@@ -202,7 +202,7 @@ _HOST = socket.gethostname()
 # ---------------------------------------------------------------------------
 # Default JSON path
 # ---------------------------------------------------------------------------
-DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params.json"
+DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_ec_ma.json"
 
 # ---------------------------------------------------------------------------
 # JSON loading + validation
@@ -283,6 +283,58 @@ def _load_params(json_path: Path) -> dict:
                         method.get("label", "<sin label>"), req_key,
                     )
                     sys.exit(1)
+
+    # [LATENT][COMMON] Validate the optional common_mode_analysis sub-block
+    # (off by default -> JSONs legacy se comportan exactamente como antes).
+    cma_cfg = latent_cfg.get("common_mode_analysis")
+    if cma_cfg is not None:
+        if not isinstance(cma_cfg, dict):
+            logger.error(
+                "latent_plots.common_mode_analysis debe ser un objeto "
+                "(o omitirse para el comportamiento por defecto: off)."
+            )
+            sys.exit(1)
+        for bkey, btype in (("enabled", bool),
+                            ("save_projection", bool),
+                            ("top_k_series", int),
+                            ("top_k_topo", int),
+                            ("chunk_cols", int)):
+            val = cma_cfg.get(bkey)
+            if val is None:
+                continue
+            # bool es subclase de int en Python: para claves int exigimos
+            # int EXACTO (un bool seria un error de tipeo del JSON).
+            type_ok = (
+                isinstance(val, btype)
+                and not (btype is int and isinstance(val, bool))
+            )
+            if not type_ok:
+                logger.error(
+                    "latent_plots.common_mode_analysis.%s debe ser %s.",
+                    bkey, "bool" if btype is bool else "int",
+                )
+                sys.exit(1)
+        if cma_cfg.get("top_k_series", 12) < 1 or cma_cfg.get("top_k_topo", 8) < 1:
+            logger.error(
+                "latent_plots.common_mode_analysis.top_k_* deben ser >= 1."
+            )
+            sys.exit(1)
+        if cma_cfg.get("chunk_cols", 50_000) < 1000:
+            logger.error(
+                "latent_plots.common_mode_analysis.chunk_cols debe ser "
+                ">= 1000 (control de memoria)."
+            )
+            sys.exit(1)
+        n_cma_meth = sum(
+            1 for m in latent_cfg.get("methods", [])
+            if m.get("stage2_dynamics") == "cdhsa_specific_modes"
+        )
+        if cma_cfg.get("enabled", False) and n_cma_meth == 0:
+            logger.warning(
+                "[LATENT][COMMON] common_mode_analysis.enabled=true pero "
+                "ningun metodo usa stage2_dynamics=cdhsa_specific_modes; "
+                "el analisis de modos comunes no se ejecutara."
+            )
 
     return params
 
@@ -430,6 +482,7 @@ class CDHSABatchRunner:
         self.delay: float = self.exec_cfg.get("delay", 2.0)
         self.max_workers: int = self.exec_cfg.get("max_workers", 1)
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
+        self.sufix = "_ec_ma"
 
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
@@ -651,6 +704,23 @@ class CDHSABatchRunner:
                 self.latent_max_workers, self.latent_delay,
                 self.latent_ignore_cache,
             )
+            cma_cfg = self.latent_cfg.get("common_mode_analysis") or {}
+            if cma_cfg.get("enabled", False):
+                logger.info(
+                    "  [LATENT][COMMON] Analisis de modos comunes (A6/W0): "
+                    "ON (top_k_series=%s, top_k_topo=%s, chunk_cols=%s, "
+                    "save_projection=%s)",
+                    cma_cfg.get("top_k_series", 12),
+                    cma_cfg.get("top_k_topo", 8),
+                    cma_cfg.get("chunk_cols", 50_000),
+                    cma_cfg.get("save_projection", True),
+                )
+            else:
+                logger.info(
+                    "  [LATENT][COMMON] Analisis de modos comunes (A6/W0): "
+                    "OFF (latent_plots.common_mode_analysis ausente o "
+                    "enabled=false)"
+                )
             logger.info(
                 "  [LATENT] (KM / potenciales: RECORTADOS por diseno)"
             )
@@ -664,11 +734,10 @@ class CDHSABatchRunner:
     # ------------------------------------------------------------------
     # Checkpoint
     # ------------------------------------------------------------------
-
     def _checkpoint_path(self) -> Path:
         if self.cache_dir:
-            return self.cache_dir / "batch_checkpoint_cdhsa.json"
-        return Path("./cache") / "batch_checkpoint_cdhsa.json"
+            return self.cache_dir / f"batch_checkpoint_cdhsa{self.sufix}.json"
+        return Path("./cache") / f"batch_checkpoint_cdhsa{self.sufix}.json"
 
     def _load_checkpoint(self) -> set[str]:
         cp = self._checkpoint_path()
@@ -1526,8 +1595,8 @@ class CDHSABatchRunner:
 
     def _latent_checkpoint_path(self) -> Path:
         if self.cache_dir:
-            return self.cache_dir / "batch_checkpoint_cdhsa_latent.json"
-        return Path("./cache") / "batch_checkpoint_cdhsa_latent.json"
+            return self.cache_dir / f"batch_checkpoint_cdhsa_latent{self.sufix}.json"
+        return Path("./cache") / f"batch_checkpoint_cdhsa_latent{self.sufix}.json"
 
     def _load_latent_checkpoint(self) -> set[str]:
         cp = self._latent_checkpoint_path()
@@ -1565,11 +1634,19 @@ class CDHSABatchRunner:
         Incluye la etiqueta del metodo, la ventana, latent_dim y el hash
         de la spec (sin las rutas auto-inyectadas) para que un cambio de
         parametros re-ejecute el job en vez de saltarselo.
+
+        v5.2: token ``cma{0|1}`` del sub-bloque ``common_mode_analysis``.
+        Cambiarlo (p.ej. activar el analisis de modos comunes) re-ejecuta
+        los jobs ya completados (la extraccion latente sale del cache npz
+        porque el spec_hash no cambia; solo se regeneran plots+analisis).
         """
+        cma = job.get("common_mode_analysis", {})
+        cma_token = "cma1" if cma.get("enabled", False) else "cma0"
         return (
             f"ss{job['super_subject_id']:02d}|{job['session']}|{job['task']}"
             f"|{job['method_label']}|{job['t_start']}|{job['t_end']}"
             f"|ld{job['shared'].get('latent_dim', 4)}|{job['spec_hash']}"
+            f"|{cma_token}"
         )
 
     def _init_latent_csv_log(self) -> Path:
@@ -1702,6 +1779,11 @@ class CDHSABatchRunner:
 
         sources = self._resolve_latent_sources()
 
+        # [COMMON] Sub-bloque opcional common_mode_analysis: se copia a cada
+        # job cuyo metodo sea cdhsa_specific_modes para que la checkpoint key
+        # (token cma) y _build_latent_command lo vean por job.
+        cma_cfg = self.latent_cfg.get("common_mode_analysis") or {}
+
         jobs: list[dict] = []
         for sid in ss_ids:
             ss_label = _super_subject_label(sid)
@@ -1716,7 +1798,7 @@ class CDHSABatchRunner:
                     continue
                 for task in self.params["tasks"]:
                     for method in methods:
-                        jobs.append({
+                        job = {
                             "super_subject_id": sid,
                             "super_subject_label": ss_label,
                             "session": session,
@@ -1730,7 +1812,10 @@ class CDHSABatchRunner:
                             "t_end": t_end,
                             "mode_map_path": src["mode_map_path"],
                             "npz_path": src["npz_path"],
-                        })
+                        }
+                        if method.get("stage2_dynamics") == "cdhsa_specific_modes":
+                            job["common_mode_analysis"] = cma_cfg
+                        jobs.append(job)
         return jobs
 
     def _precompute_latent_channel_intersections(self) -> None:
@@ -1898,6 +1983,30 @@ class CDHSABatchRunner:
         # --- Boolean flags ---
         if shared.get("ignore_cache", False) or self.latent_ignore_cache:
             cmd.append("--ignore-cache")
+
+        # [COMMON] Common-mode analysis flags (sub-bloque opcional del JSON;
+        # solo el metodo cdhsa_specific_modes los consume, pero pasarlos
+        # a los demas metodos es inofensivo: el pipeline los ignora cuando
+        # stage2_dynamics != cdhsa_specific_modes).
+        cma = self.latent_cfg.get("common_mode_analysis") or {}
+        job_cma = job.get("common_mode_analysis") or {}
+        eff_cma = job_cma if job_cma else cma
+        if eff_cma.get("enabled", False):
+            cmd.append("--common-mode-analysis")
+            if eff_cma.get("top_k_series") is not None:
+                cmd.extend([
+                    "--common-top-k-series", str(eff_cma["top_k_series"]),
+                ])
+            if eff_cma.get("top_k_topo") is not None:
+                cmd.extend([
+                    "--common-top-k-topo", str(eff_cma["top_k_topo"]),
+                ])
+            if eff_cma.get("chunk_cols") is not None:
+                cmd.extend([
+                    "--common-chunk-cols", str(eff_cma["chunk_cols"]),
+                ])
+            if eff_cma.get("save_projection") is False:
+                cmd.append("--common-no-save-projection")
         if not shared.get("verbose", True):
             cmd.append("--no-verbose")
 

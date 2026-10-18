@@ -1124,12 +1124,20 @@ class CDHSASpecificModesDynamics:
                     common_eigenvalues = [float(v) for v in lambda0_raw]
                 else:
                     common_eigenvalues = [float(lambda0_raw)]
-            # U0 may or may not be in the JSON (large array);
-            # fall back to NPZ if needed for spatial structure plots.
-            if "U0" in common_subspace:
-                U0_raw = common_subspace["U0"]
-                if isinstance(U0_raw, list):
-                    W_common = np.array(U0_raw, dtype=np.float64)
+            # W0 (a.k.a. U0 in early drafts) may or may not be in the
+            # JSON (large array); fall back to NPZ if needed for spatial
+            # structure plots.
+            # v5.2 fix: the real keys are "W0" (mode_map common_subspace,
+            # written by extract_mode_indices from A6__W0) and "A6__W0"
+            # (npz).  The previous lookup ("U0"/"A6__U0") matched NO real
+            # source, so W_common was ALWAYS None and the common row of
+            # stage2_cdhsa_mode_structure.png was silently never drawn.
+            for _w0_key in ("W0", "U0"):
+                if _w0_key in common_subspace:
+                    U0_raw = common_subspace[_w0_key]
+                    if isinstance(U0_raw, list):
+                        W_common = np.array(U0_raw, dtype=np.float64)
+                    break
 
         # If r0 not found in mode_map JSON, try NPZ directly
         if r0 is None and "A6__r0" in npz_data:
@@ -1137,8 +1145,11 @@ class CDHSASpecificModesDynamics:
         if common_eigenvalues is None and "A6__lambda0" in npz_data:
             lam0 = npz_data["A6__lambda0"]
             common_eigenvalues = lam0.flatten().tolist()
-        if W_common is None and "A6__U0" in npz_data:
-            W_common = npz_data["A6__U0"].astype(np.float64)
+        if W_common is None:
+            for _npz_key in ("A6__W0", "A6__U0"):   # v5.2: A6__W0 is the real key
+                if _npz_key in npz_data:
+                    W_common = npz_data[_npz_key].astype(np.float64)
+                    break
 
         n_common = r0 if r0 is not None else 0
 
