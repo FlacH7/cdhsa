@@ -482,7 +482,7 @@ class CDHSABatchRunner:
         self.delay: float = self.exec_cfg.get("delay", 2.0)
         self.max_workers: int = self.exec_cfg.get("max_workers", 1)
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
-        self.sufix = "ec_mu"
+        self.sufix = "_ec_mu"
 
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
