@@ -1,0 +1,125 @@
+{
+  "experiment_label": "session2_classification_ss_training_v1",
+
+  "_comment_experiment": [
+    "Experimento de clasificacion con hold-out de SESION.",
+    "TRAIN: modelos CD-HSA entrenados con SUPER-SUJETOS de la sesion 1",
+    "(los experimentos ec_mu / ec_ma lanzados con run_batch_cdhsa).",
+    "TEST: sujetos INDIVIDUALES de la sesion 2 (60 sujetos x tareas del",
+    "experimento). Cada grabacion se clasifica de forma independiente.",
+    "FASE 0 (auditoria): ANTES de procesar nada se verifica, grabacion a",
+    "grabacion (solo cabeceras .set), que canales y duraciones permiten",
+    "alinear cada sujeto a los canales del entrenamiento (p. ej. 53).",
+    "FASE 1: un job de clasificacion por experimento del bloque",
+    "'experiments' (pipeline run_cdhsa_session2_classification).",
+    "FASE 2: analisis cross-experimento: sujetos perfectos en TODOS los",
+    "experimentos, sujetos que fallan en TODOS, accuracies con IC y",
+    "tasas de error por tarea.",
+    "El 12x de longitud de los SS frente a los sujetos simples NO es un",
+    "impedimento: W0/W_c viven en R^(n_ch*depth*L) (independiente de T)",
+    "y la decision compara clases sobre la MISMA Hankel de test (la",
+    "escala se cancela en el argmax; ver diagnostico de escalabilidad)."
+  ],
+
+  "training_models": {
+    "_comment": [
+      "Modelos SS disponibles. 'tasks' debe ser la lista de condiciones",
+      "del entrenamiento (la del hankel_info.json del train).",
+      "results_dir: null => AUTO-DESCUBRIMIENTO bajo training_root/",
+      "{training_session}/ buscando la corrida cuyas tareas coincidan",
+      "(plantilla: nSS5_L10_var99c50_a6n200_bcn5000/1.0-40.0Hz_depth10/",
+      "from100.0s_to200.0s_{tasks}). Si hay ambiguedad el batch aborta",
+      "con la lista de candidatas. Puedes fijar la ruta a mano.",
+      "Para experimentos de 3/4/5 tareas: anade aqui el modelo entrenado",
+      "con esas tareas (p. ej. el de 5 tareas del batch original) y un",
+      "experimento con esas tasks."
+    ],
+    "ec_mu": {
+      "tasks": ["eyesclosed", "music"],
+      "results_dir": null
+    },
+    "ec_ma": {
+      "tasks": ["eyesclosed", "mathematic"],
+      "results_dir": null
+    }
+  },
+  "training_root": null,
+  "_comment_training_root": "null => BASE_RESULTS_PATH/cdhsa (results/cdhsa).",
+  "training_session": "session1",
+
+  "test": {
+    "session": "session2",
+    "subjects": {
+      "n_subjects": 60,
+      "subject_start_offset": 1,
+      "subject_ids": null,
+      "_comment": "subject_ids explicito (lista) gana sobre n_subjects."
+    },
+    "time_window": {
+      "t_start": 100.0,
+      "t_end": 200.0,
+      "_comment": "DEBE coincidir con la ventana del entrenamiento (el batch la valida contra el nombre del dir de train)."
+    },
+    "min_duration_s": 130.0,
+    "_comment_min_duration": "Duracion total minima (s) de una grabacion para ser usable: t_start + 30s de datos. Ventanas efectivas mas cortas se saltan.",
+    "channels": {
+      "missing_policy": "interpolate",
+      "max_missing_to_interpolate": 4,
+      "_comment": [
+        "interpolate: canales del train ausentes se reconstruyen con",
+        "splines esfericos (montaje standard_1020) si faltan <= ",
+        "max_missing_to_interpolate y no son EOG; si no, la grabacion",
+        "se salta. skip: cualquier ausencia salta la grabacion."
+      ]
+    }
+  },
+
+  "experiments": [
+    {
+      "name": "ec_vs_mu",
+      "model": "ec_mu",
+      "tasks": ["eyesclosed", "music"]
+    },
+    {
+      "name": "ec_vs_ma",
+      "model": "ec_ma",
+      "tasks": ["eyesclosed", "mathematic"]
+    }
+  ],
+  "_comment_experiments": [
+    "Cada experimento = un job de clasificacion. 'tasks': subconjunto",
+    "(>=2) de las condiciones del modelo, en el orden que fija el",
+    "indice de clase del test (por defecto, el orden del train).",
+    "Ejemplo de 3 clases con un modelo de 3+ condiciones:",
+    "{\"name\": \"ec_ma_mu\", \"model\": \"<modelo con esas 3 tareas>\",",
+    " \"tasks\": [\"eyesclosed\", \"mathematic\", \"memory\"]}"
+  ],
+
+  "classification": {
+    "method": "energy",
+    "rank_truncation": "min",
+    "n_perm": 10000,
+    "seed": 20261006,
+    "make_plots": true,
+
+    "_comment": [
+      "method: 'energy' (energia residual capturada por W_c a rango",
+      "comun d=min(r_c); recomendado) | 'ml' (regla de Bayes spiked;",
+      "requiere hankel_matrices.npz del train y anade ~20-40 min por",
+      "modelo, cache compartida entre experimentos) | 'both'.",
+      "rank_truncation: 'min' (d = min r_c de las clases del",
+      "experimento) o un entero en [1, min(r_c)]."
+    ]
+  },
+
+  "cross_experiment": {
+    "enabled": true,
+    "_comment": "Analisis cross-experimento (fase 2): grid sujetos x experimentos, perfectos/todos-malos, accuracy con IC, errores por tarea."
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "_comment": "max_workers debe ser 1 (secuencial): cada job de clasificacion ya itera sobre las 120 grabaciones."
+  }
+}
