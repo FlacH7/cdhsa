@@ -202,7 +202,7 @@ _HOST = socket.gethostname()
 # ---------------------------------------------------------------------------
 # Default JSON path
 # ---------------------------------------------------------------------------
-DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_ec_ma.json"
+DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_ec_mu.json"
 
 # ---------------------------------------------------------------------------
 # JSON loading + validation
@@ -482,7 +482,7 @@ class CDHSABatchRunner:
         self.delay: float = self.exec_cfg.get("delay", 2.0)
         self.max_workers: int = self.exec_cfg.get("max_workers", 1)
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
-        self.sufix = "_ec_ma"
+        self.sufix = "_ec_mu"
 
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
