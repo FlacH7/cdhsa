@@ -358,20 +358,33 @@ def _decide(header: dict, target: list[str], *, policy: str,
 
     channels = header.get("channels") or []
     # Duplicados tras la normalizacion: el cargador no puede desambiguar.
-    if len(channels) != len(set(channels)):
-        dup = sorted({c for c in channels if channels.count(c) > 1})
+    # [FIX 2026-10-19] Comparacion case-insensitive (ver nota abajo).
+    upper = [c.upper() for c in channels]
+    if len(upper) != len(set(upper)):
+        dup = sorted({c for c in channels if upper.count(c.upper()) > 1})
         d["reason"] = f"duplicate_channels:{','.join(dup)}"
         return d
 
-    have = set(channels)
-    missing = [c for c in target if c not in have]
+    # [FIX 2026-10-19] Comparacion case-insensitive target/header.
+    # Los ``global_channels`` del ``hankel_info.json`` del train viven
+    # con el CASE del fichero original: el cargador Gedai renombra
+    # 'EEG Fp1' -> 'Fp1' SIN pasar a mayusculas
+    # (test_retest_gedai_eeg.py, ``rename_channels``), mientras que
+    # ``read_recording_header`` normaliza los nombres a MAYUSCULAS
+    # (whitelist del cargador). Comparar 'Fp1' contra 'FP1' marcaba
+    # TODOS los canales como ausentes -> "skip 180" con datos sanos
+    # (observado en la corrida real de session2: auditoria 0 usables
+    # pero 0 interpolaciones y 0 saltos por canales en FASE 1, que
+    # usa ``align_raw_to_channels`` y esa si es case-safe).
+    have = {c.upper() for c in channels}
+    missing = [c for c in target if str(c).upper() not in have]
     d["n_missing"] = len(missing)
     d["missing"] = missing
     if not missing:
         d.update({"usable": True, "action": "ok", "reason": None})
         return d
     if policy == "interpolate" and len(missing) <= int(max_missing) \
-            and not any(c in _EOG_NAMES for c in missing):
+            and not any(str(c).upper() in _EOG_NAMES for c in missing):
         d.update({"usable": True, "action": "interpolate",
                   "reason": None})
         return d
