@@ -382,6 +382,7 @@ def load_super_subject_eeg(
     preload: bool = False,
     verbose: bool | str | None = None,
     return_member_lengths: bool = False,
+    member_tasks: list[str] | None = None,
 ) -> mne.io.Raw | tuple[mne.io.Raw, list[int]]:
     """
     Load and concatenate the EEG recordings of all individual subjects
@@ -430,6 +431,16 @@ def load_super_subject_eeg(
         CD-HSA pipeline uses to mask the level-2 Hankel columns that
         cross concatenation boundaries (paper promise; see
         ``a_common_subspace.level2_boundary_mask``).
+    member_tasks : list[str] | None, default None
+        [TASK-SHUFFLE, control negativo] Tarea REAL a cargar para cada
+        miembro, alineada posicionalmente con los ``subject_ids``
+        resueltos: ``member_tasks[i]`` es la tarea del sujeto
+        ``subject_ids[i]``.  Cuando es None (default) todos los
+        miembros se cargan con ``task`` — comportamiento historico
+        identico.  Cuando se pasa, ``task`` pasa a ser solo la etiqueta
+        NOMINAL de la celda (para logs/metadata) y cada miembro se
+        carga con su tarea permutada.  La longitud debe coincidir con
+        la de ``subject_ids`` resuelto.
 
     Returns
     -------
@@ -471,22 +482,45 @@ def load_super_subject_eeg(
         print(f"  [SuperSubject] subjects ({len(subject_ids)}): "
               f"{subject_ids[0]}..{subject_ids[-1]}")
 
+    # [TASK-SHUFFLE] Validar la correspondencia posicional
+    # member_tasks[i] <-> subject_ids[i]
+    if member_tasks is not None:
+        if len(member_tasks) != len(subject_ids):
+            raise ValueError(
+                "member_tasks debe tener la misma longitud que los "
+                f"subject_ids resueltos ({len(subject_ids)}); "
+                f"recibidos: {len(member_tasks)}."
+            )
+        _mix = ", ".join(
+            f"{t} x{n}" for t, n in sorted(
+                {t: member_tasks.count(t) for t in set(member_tasks)}.items()
+            )
+        )
+        logger.info(
+            "  [SuperSubject][TASK-SHUFFLE] SS=%d celda nominal '%s' "
+            "-> mezcla real: %s",
+            super_subject_id, task, _mix,
+        )
+
     # Load each individual raw
     raws: list[mne.io.Raw] = []
     _load_t0 = time.time()
     _n_total = len(subject_ids)
     for _load_i, subj_idx in enumerate(subject_ids, 1):
+        # [TASK-SHUFFLE] tarea real de ESTE miembro (o la nominal)
+        _task_i = (member_tasks[_load_i - 1]
+                   if member_tasks is not None else task)
         subject = f"sub-{subj_idx:02d}"
         if verbose:
             _elapsed = time.time() - _load_t0
             _eta = (_elapsed / _load_i) * (_n_total - _load_i) if _load_i > 0 else 0
-            print(f"  [SuperSubject]   Loading {_load_i}/{_n_total} {subject}/{session}/{task}..."
+            print(f"  [SuperSubject]   Loading {_load_i}/{_n_total} {subject}/{session}/{_task_i}..."
                   f"  (elapsed: {_elapsed:.1f}s, ETA: {_eta:.0f}s)")
         try:
             raw_i = load_test_retest_gedai_eeg_from_ids(
                 subject=subject,
                 session=session,
-                task=task,
+                task=_task_i,
                 db_path=db_path,
                 t_start=t_start,
                 t_stop=t_stop,

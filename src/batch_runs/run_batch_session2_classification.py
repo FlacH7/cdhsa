@@ -528,7 +528,13 @@ class Session2ClassificationBatchRunner:
 
     def _find_model_candidates(self, model_key: str,
                                model_cfg: dict) -> list[Path]:
-        """Candidatos (dirs con hankel_info.json) para un modelo."""
+        """Candidatos (dirs con hankel_info.json) para un modelo.
+
+        Los trains con task_shuffle (control negativo: tareas
+        permutadas por sujeto al armar los SS) se EXCLUYEN
+        automaticamente: no son modelos validos para clasificar (las
+        etiquetas de condicion de sus celdas son nominales).
+        """
         tasks = set(model_cfg["tasks"])
         session = self.params.get("training_session", "session1")
         root = self.training_root / session
@@ -540,6 +546,12 @@ class Session2ClassificationBatchRunner:
                 with open(info_path, "r", encoding="utf-8") as fh:
                     hinfo = json.load(fh)
             except (json.JSONDecodeError, OSError):
+                continue
+            if hinfo.get("task_shuffle_seed") is not None:
+                logger.debug(
+                    "Candidato excluido (task_shuffle seed=%s): %s",
+                    hinfo.get("task_shuffle_seed"), info_path.parent,
+                )
                 continue
             if set(hinfo.get("tasks", [])) == tasks:
                 candidates.append(info_path.parent)
@@ -617,6 +629,14 @@ class Session2ClassificationBatchRunner:
                              "!= declaradas %s", key,
                              info["hankel_info"].get("tasks"),
                              model_cfg["tasks"])
+                return False
+            if info["hankel_info"].get("task_shuffle_seed") is not None:
+                logger.error(
+                    "Modelo '%s': results_dir=%s corresponde a un train "
+                    "con task_shuffle (seed=%s, control negativo): NO "
+                    "es un modelo valido para clasificar.",
+                    key, train_dir,
+                    info["hankel_info"].get("task_shuffle_seed"))
                 return False
             if not self._train_artifacts_complete(train_dir):
                 return False

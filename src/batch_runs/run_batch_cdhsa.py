@@ -202,11 +202,32 @@ _HOST = socket.gethostname()
 # ---------------------------------------------------------------------------
 # Default JSON path
 # ---------------------------------------------------------------------------
-DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_ec_mu.json"
+DEFAULT_PARAMS_JSON = _SCRIPT_DIR / "cdhsa_batch_params_ec_ma_taskshuffle.json"
 
 # ---------------------------------------------------------------------------
 # JSON loading + validation
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# [TASK-SHUFFLE] Control negativo: semilla de permutacion de tareas
+# ---------------------------------------------------------------------------
+
+def _task_shuffle_seed(ss_cfg: dict | None) -> int | None:
+    """Semilla del task-shuffle desde el bloque super_subjects del JSON.
+
+    Estructura esperada (opcional; ausente o enabled=false => None,
+    comportamiento historico exacto)::
+
+        "super_subjects": {
+            ...,
+            "task_shuffle": {"enabled": true, "seed": 20261022}
+        }
+    """
+    ts = (ss_cfg or {}).get("task_shuffle") or {}
+    if not ts.get("enabled", False):
+        return None
+    return int(ts["seed"])
 
 
 def _load_params(json_path: Path) -> dict:
@@ -257,6 +278,38 @@ def _load_params(json_path: Path) -> dict:
                 "En modo multi-SS, 'super_subjects.total_subjects' es requerido."
             )
             sys.exit(1)
+
+    # [TASK-SHUFFLE] Validacion del control negativo (opcional)
+    ts_cfg = ss_cfg.get("task_shuffle")
+    if ts_cfg is not None:
+        if not isinstance(ts_cfg, dict):
+            logger.error("'super_subjects.task_shuffle' debe ser un objeto "
+                         "con 'enabled' (bool) y 'seed' (int).")
+            sys.exit(1)
+        if ts_cfg.get("enabled", False):
+            if not is_multi_ss:
+                logger.error("task_shuffle solo esta soportado en modo "
+                             "multi-SS (n_super_subjects): el control "
+                             "permuta tareas entre las celdas de cada SS.")
+                sys.exit(1)
+            if "seed" not in ts_cfg or not isinstance(ts_cfg["seed"], int) \
+                    or ts_cfg["seed"] < 0:
+                logger.error("task_shuffle.enabled=true requiere 'seed' "
+                             "(int >= 0) para reproducibilidad.")
+                sys.exit(1)
+            if len(params["tasks"]) < 2:
+                logger.error("task_shuffle requiere >= 2 tareas.")
+                sys.exit(1)
+            if (params.get("latent_plots") or {}).get("enabled", False):
+                logger.error("task_shuffle + latent_plots.enabled=true no "
+                             "esta soportado: la fase latente re-carga "
+                             "por tarea y los modos especificos del "
+                             "control negativo no tienen interpretacion "
+                             "dinamica. Deje latent_plots.enabled=false.")
+                sys.exit(1)
+            logger.info("[TASK-SHUFFLE] CONTROL NEGATIVO activo: seed=%s "
+                        "(permutacion de tareas por sujeto al armar los SS)",
+                        ts_cfg["seed"])
 
     # Validate cdhsa_params
     cdhsa = params["cdhsa_params"]
@@ -482,7 +535,7 @@ class CDHSABatchRunner:
         self.delay: float = self.exec_cfg.get("delay", 2.0)
         self.max_workers: int = self.exec_cfg.get("max_workers", 1)
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
-        self.sufix = "_ec_mu"
+        self.sufix = "_ec_ma_taskshuffle"
 
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
@@ -620,6 +673,11 @@ class CDHSABatchRunner:
             logger.info("  Subjects/SS     : %d (offset %d)",
                         spp, self.ss_cfg.get("subject_start_offset", 1))
             logger.info("  Total subjects  : %d", self.ss_cfg["total_subjects"])
+            _ts_banner = _task_shuffle_seed(self.ss_cfg)
+            if _ts_banner is not None:
+                logger.info("  Task shuffle    : seed=%d (CONTROL NEGATIVO:"
+                            " tareas permutadas por sujeto en cada SS)",
+                            _ts_banner)
         else:
             logger.info(
                 "  Super-subjects  : %d  -> %s",
@@ -779,15 +837,20 @@ class CDHSABatchRunner:
         tb = cdhsa.get("tangent_blocks_mode", "cumulative")[:4]
         bm = "bm0" if cdhsa.get("no_boundary_mask", False) else "bm1"
         mc = f"mc{cdhsa.get('max_common', 30)}"
+        # [TASK-SHUFFLE] token del control negativo: el mismo job con
+        # y sin permutacion son corridas DISTINTAS (nunca re-usar el
+        # checkpoint de la otra).
+        _ts = _task_shuffle_seed(job.get("ss_cfg"))
+        ts_tok = f"|ts{_ts}" if _ts is not None else ""
         if job.get("mode") == "multi_ss":
             return (f"multiss_{job['n_super_subjects']}|{job['session']}|"
                     f"{tasks_str}|{job['t_start']}|{job['t_end']}|"
-                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}")
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}{ts_tok}")
         else:
             sid = job["super_subject_id"]
             return (f"ss{sid:02d}|{job['session']}|{tasks_str}|"
                     f"{job['t_start']}|{job['t_end']}|"
-                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}")
+                    f"L{cdhsa.get('L', '?')}|{rtag}|{mc}|{tb}|{bm}{ts_tok}")
 
     # ------------------------------------------------------------------
     # CSV log
@@ -902,6 +965,12 @@ class CDHSABatchRunner:
 
         # Tasks (all in a single --tasks invocation, since run_cdhsa.py uses nargs='+')
         cmd.extend(["--tasks"] + job["tasks"])
+
+        # [TASK-SHUFFLE] Control negativo: permutacion de tareas por
+        # sujeto al armar los SS (solo si el JSON lo activa).
+        _ts_seed = _task_shuffle_seed(job.get("ss_cfg"))
+        if _ts_seed is not None:
+            cmd.extend(["--ss-task-shuffle-seed", str(_ts_seed)])
 
         # Time window
         cmd.extend([
@@ -1053,6 +1122,12 @@ class CDHSABatchRunner:
             f"/from{t_start_tag}s_to{t_end_tag}s"
             f"_{'_'.join(tasks)}"
         )
+        # [TASK-SHUFFLE] token del control negativo: separa el out_dir
+        # del run permutado del run real (misma config, distinto
+        # contenido) y evita la colision con el baseline.
+        _ts = _task_shuffle_seed(job.get("ss_cfg"))
+        if _ts is not None:
+            out_dir = Path(str(out_dir) + f"_taskshuf{_ts}")
         return out_dir
 
     # ------------------------------------------------------------------
@@ -1495,6 +1570,18 @@ class CDHSABatchRunner:
 
         for job in self.all_jobs:
             out_dir = self._get_output_dir(job)
+
+            # [TASK-SHUFFLE] El control negativo NO extrae modos: los
+            # modos especificos del run permutado no tienen
+            # interpretacion dinamica y el mode_map sobreescribiria el
+            # del run real (mismo nombre de fichero en params_dir).
+            _ts_extract = _task_shuffle_seed(job.get("ss_cfg"))
+            if _ts_extract is not None:
+                logger.info(
+                    "  EXTRACT | SKIP (task_shuffle seed=%d): control "
+                    "negativo sin extraccion de modos", _ts_extract)
+                n_skip += 1
+                continue
 
             # Verify the results directory has the required files
             if not (out_dir / "cdhsa_arrays.npz").exists():

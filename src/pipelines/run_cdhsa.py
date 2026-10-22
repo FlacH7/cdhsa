@@ -442,6 +442,7 @@ def build_hankel_from_eeg(
     h_freq: float = 40.0,
     hankel_depth: int | None = None,
     verbose: bool | str | None = None,
+    task_shuffle_seed: int | None = None,
 ) -> tuple[list[list[NDArray[np.floating]]], dict]:
     """Construir matrices de Hankel para cada par (super-sujeto, condicion).
 
@@ -470,7 +471,10 @@ def build_hankel_from_eeg(
         Metadata completa de la construccion. Incluye
         ``member_n_times[s][c]`` (muestras de cada sujeto miembro tras
         recorte+filtro) para el enmascaramiento de fronteras de nivel 2
-        (ver ``a_common_subspace.level2_boundary_mask``).
+        (ver ``a_common_subspace.level2_boundary_mask``).  Con
+        ``task_shuffle_seed`` incluye ademas ``task_shuffle_seed`` y el
+        bloque ``task_shuffle`` (semilla, modo y asignacion completa
+        SS x sujeto x celda) para trazabilidad del control negativo.
     """
     from src.latent_space_extraction.super_subject_eeg import (
         load_super_subject_eeg,
@@ -514,6 +518,48 @@ def build_hankel_from_eeg(
     print()
 
     # =================================================================
+    # [TASK-SHUFFLE] Control negativo: permutacion de tareas por sujeto
+    # =================================================================
+    # La particion de sujetos se resuelve POR ADELANTADO (la misma que
+    # usara el bucle de carga) para construir la asignacion aleatoria
+    # completa de una sola vez: la secuencia de permutaciones es
+    # determinista dado (seed, particion, orden de tasks).
+    task_shuffle_assignment: dict[int, dict[int, list[str]]] | None = None
+    if task_shuffle_seed is not None:
+        from src.cdhsa.ss_task_shuffle import (
+            build_task_shuffle_assignment,
+            member_tasks_for_cell,
+            summarize_task_mix,
+        )
+        _ss_ids_for_shuffle: dict[int, list[int]] = {}
+        for ss_id in range(1, S + 1):
+            _ss_ids_for_shuffle[ss_id] = resolve_super_subject_subject_ids(
+                super_subject_id=ss_id,
+                subjects_per_super_subject=subjects_per,
+                subject_start_offset=subject_start_offset,
+            )
+        task_shuffle_assignment = build_task_shuffle_assignment(
+            _ss_ids_for_shuffle, tasks, int(task_shuffle_seed)
+        )
+        print("=" * 70)
+        print(f"  [TASK-SHUFFLE] CONTROL NEGATIVO ACTIVO (seed={task_shuffle_seed})")
+        print("  Las C grabaciones de cada sujeto se reparten AL AZAR entre")
+        print("  las C celdas de su super-sujeto: cada celda es una mezcla")
+        print("  aleatoria de tareas. Las etiquetas de condicion (nominales)")
+        print("  dejan de tener significado -> Steps B/D deben quedar nulos.")
+        print("=" * 70)
+        for ss_id in range(1, S + 1):
+            for c_idx in range(C):
+                _mt = member_tasks_for_cell(
+                    task_shuffle_assignment, ss_id,
+                    _ss_ids_for_shuffle[ss_id], c_idx,
+                )
+                print(f"  [TASK-SHUFFLE]   SS {ss_id} | celda '{tasks[c_idx]}'"
+                      f" <- {summarize_task_mix(_mt)}")
+        print("=" * 70)
+        print()
+
+    # =================================================================
     # PASADA 0: Cargar todos los raws y calcular interseccion global
     # =================================================================
     print("  PASADA 0: Cargando raws para calcular interseccion global de canales...")
@@ -534,6 +580,13 @@ def build_hankel_from_eeg(
         ss_member_ids[ss_id] = member_ids
 
         for c_idx, task in enumerate(tasks):
+            # [TASK-SHUFFLE] tarea real por miembro para ESTA celda
+            _member_tasks_c = (
+                member_tasks_for_cell(
+                    task_shuffle_assignment, ss_id, member_ids, c_idx
+                )
+                if task_shuffle_assignment is not None else None
+            )
             tag = (f"  [{ss_id}/{S}] (subs {member_ids[0]}..{member_ids[-1]})"
                    f"/{session}/{task}")
             print(f"{tag} ...", end=" ")
@@ -552,6 +605,7 @@ def build_hankel_from_eeg(
                     preload=True,
                     verbose=False,
                     return_member_lengths=True,
+                    member_tasks=_member_tasks_c,
                 )
             except (FileNotFoundError, ValueError) as exc:
                 print(f"SKIP ({exc})")
@@ -718,6 +772,31 @@ def build_hankel_from_eeg(
         "elapsed_load": time.time() - t0_load,
         "elapsed_build": elapsed,
     }
+    # [TASK-SHUFFLE] Trazabilidad del control negativo: la semilla a
+    # nivel superior (para que el auto-descubrimiento de la
+    # clasificacion session2 pueda EXCLUIR este train) y el bloque
+    # completo con la asignacion SS x sujeto x celda.
+    if task_shuffle_seed is not None and task_shuffle_assignment is not None:
+        info["task_shuffle_seed"] = int(task_shuffle_seed)
+        info["task_shuffle"] = {
+            "seed": int(task_shuffle_seed),
+            "mode": "within_subject",
+            "description": (
+                "Control negativo: las C grabaciones de cada sujeto se "
+                "reparten aleatoriamente entre las C celdas de su "
+                "super-sujeto (permutacion por sujeto). Las etiquetas "
+                "de condicion son nominales: cada celda es una mezcla "
+                "aleatoria de tareas. NO usar como modelo de "
+                "clasificacion."
+            ),
+            "assignment": {
+                str(ss_id): {
+                    str(subj): list(per_cell)
+                    for subj, per_cell in per_ss.items()
+                }
+                for ss_id, per_ss in task_shuffle_assignment.items()
+            },
+        }
     if sfreqs:
         info["sfreq_common"] = (sfreqs[0] if len(set(sfreqs)) == 1
                                  else None)
@@ -1061,6 +1140,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Indice del primer sujeto. Default: 1",
     )
     parser.add_argument(
+        "--ss-task-shuffle-seed", type=int, default=None,
+        help=("[CONTROL NEGATIVO] Semilla del task-shuffle: las C "
+              "grabaciones de cada sujeto se reparten aleatoriamente "
+              "entre las C celdas de su super-sujeto (permutacion por "
+              "sujeto, determinista dada la semilla). Solo modo multi-SS. "
+              "Default: None (comportamiento historico sin permutar)."),
+    )
+    parser.add_argument(
         "--db-path", type=str, default=None,
         help="Raiz del dataset Gedai",
     )
@@ -1256,6 +1343,11 @@ def _resolve_out_dir(args: argparse.Namespace) -> Path:
         f"/from{t_start_tag}_to{t_end_tag}"
         f"_{'_'.join(args.tasks)}"
     )
+    # [TASK-SHUFFLE] token de control negativo: separa el out_dir del
+    # run permutado del run real (misma config, distinto contenido).
+    if getattr(args, "ss_task_shuffle_seed", None) is not None:
+        out_dir = Path(str(out_dir) +
+                       f"_taskshuf{int(args.ss_task_shuffle_seed)}")
     out_dir.mkdir(parents=True, exist_ok=True)
     return out_dir
 
@@ -1472,6 +1564,17 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     verbose = "INFO" if args.verbose else None
 
+    # [TASK-SHUFFLE] Fail-fast: el control negativo solo tiene sentido
+    # en modo multi-SS (permuta tareas ENTRE las celdas de cada SS);
+    # abortar ANTES de crear directorios o cargar datos.
+    if args.super_subject_id is not None and \
+            getattr(args, "ss_task_shuffle_seed", None) is not None:
+        print("[ERROR] --ss-task-shuffle-seed solo esta soportado en modo "
+              "multi-SS (--n-super-subjects): el control negativo "
+              "permuta tareas ENTRE las celdas de un mismo "
+              "super-sujeto.")
+        return 2
+
     # 0. Resolver directorio de salida
     if not args.no_save:
         out_dir = _resolve_out_dir(args)
@@ -1518,6 +1621,7 @@ def main(argv: list[str] | None = None) -> int:
             h_freq=args.h_freq,
             hankel_depth=args.hankel_depth,
             verbose=verbose,
+            task_shuffle_seed=getattr(args, "ss_task_shuffle_seed", None),
         )
 
     # 2. Caracterizar
