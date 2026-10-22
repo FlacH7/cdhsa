@@ -115,6 +115,60 @@ the batch sends push notifications through https://ntfy.sh:
 
 Without ``NTFY_CHANNEL`` all of this is a silent no-op and the batch
 behaves exactly as before.
+
+[SS-SHUFFLE] Aislamiento total del control negativo (TODO-EN-UNO)
+------------------------------------------------------------------
+El bloque opcional ``ss_shuffle`` del JSON convierte UNA corrida del
+batch en la corrida COMPLETA del control negativo task-shuffle, con
+TODO su output en un arbol separado (cero colision con el experimento
+real ec_ma / ec_mu)::
+
+    {
+      "ss_shuffle": {
+          "enabled": true,
+          "root_name": "ss_shufle",
+          "reuse_existing_run": true,
+          "reuse_copy": false,
+          "influence_figures": true,
+          "figures_force": false,
+          "figures_no_topo": false
+      }
+    }
+
+Que hace cada clave (todas opt-in; sin el bloque, comportamiento
+historico exacto):
+
+* ``enabled``: redirige results/cache/params a ``<base>/<root_name>/``
+  (p.ej. ``results/ss_shufle/``, ``cache/ss_shufle/``,
+  ``params/ss_shufle/``) y exporta las variables ``BASE_*`` al
+  entorno para que TODOS los subprocesos (pipeline, extraccion de
+  modos, figuras) escriban en el mismo arbol aislado. El ``.env``
+  del usuario NO se toca.
+* ``reuse_existing_run``: FASE 0 de reuso. Antes de computar nada,
+  migra el run del control que ya existe en el arbol real
+  (``results/cdhsa/..._taskshuf{seed}``) al arbol aislado (mueve; con
+  ``reuse_copy=true`` copia). Tambien migra el mode_map con token
+  taskshuf si existia en ``params/``. Guardia paranoica: solo se
+  toca un directorio cuyo nombre termina EXACTAMENTE en
+  ``_taskshuf{seed}``.
+* ``influence_figures``: fase final que genera las figuras de
+  influencia de los canales ORIGINALES sobre los modos COMUNES
+  (A6/W0) y los ESPECIFICOS (Step D) de cada (SS, celda), usando las
+  celdas PERMUTADAS con las que el control entreno. Requiere
+  ``task_shuffle.extract_modes=true`` y
+  ``execution.mode_extract_top_n > 0``. Skip automatico si ya existe
+  ``summary_channel_influence.json`` (salvo ``figures_force=true``).
+* ``figures_no_topo`` / ``figures_top_k_series`` /
+  ``figures_top_k_topo`` / ``influence_figures_script``: opciones de
+  la fase de figuras (script por defecto:
+  ``scripts/analyze_channel_influence_taskshuffle.py``).
+
+Ademas, ``_filter_todo`` tiene una red de seguridad para jobs del
+control: si ``cdhsa_arrays.npz`` ya esta en su out_dir (migrado o de
+una corrida previa), el job se salta aunque el checkpoint no lo sepa
+(cero riesgo de re-entrenar ~6 h por un checkpoint malogrado). La
+corrida NO compara con los runs reales: la comparacion es visual y
+la hace usted despues.
 """
 
 from __future__ import annotations
@@ -125,6 +179,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -230,6 +286,36 @@ def _task_shuffle_seed(ss_cfg: dict | None) -> int | None:
     return int(ts["seed"])
 
 
+def _task_shuffle_extract_modes(ss_cfg: dict | None) -> bool:
+    """[TASK-SHUFFLE] Extraer mode_map.json aun con el control activo.
+
+    ``super_subjects.task_shuffle.extract_modes`` (bool, opcional,
+    default ``False``):
+
+    - ``False``/ausente => gate historico: la extraccion de modos se
+      salta en runs con shuffle (comportamiento del paquete original).
+    - ``True`` => la extraccion corre, con el token ``taskshuf{seed}``
+      en el nombre del JSON (no colisiona con el mode_map del run
+      real) y un aviso de etiquetas nominales en el log.
+
+    Los indices del mode_map del control se refieren a celdas cuya
+    etiqueta de condicion es NOMINAL (mezcla aleatoria de tareas):
+    sirve para inspeccion del control, no como mapa por tarea.
+    """
+    ts = (ss_cfg or {}).get("task_shuffle") or {}
+    return bool(ts.get("extract_modes", False))
+
+
+# [SS-SHUFFLE] Nombre por defecto de la carpeta aislada del control.
+_SS_SHUFFLE_DEFAULT_ROOT = "ss_shuffle"
+
+
+def _ss_shuffle_root_name(sss: dict | None) -> str:
+    """Nombre seguro de la carpeta aislada (validado en _load_params)."""
+    sss = sss or {}
+    return str(sss.get("root_name", _SS_SHUFFLE_DEFAULT_ROOT))
+
+
 def _load_params(json_path: Path) -> dict:
     """Load and validate the batch JSON parameters."""
     if not json_path.exists():
@@ -297,6 +383,11 @@ def _load_params(json_path: Path) -> dict:
                 logger.error("task_shuffle.enabled=true requiere 'seed' "
                              "(int >= 0) para reproducibilidad.")
                 sys.exit(1)
+            if "extract_modes" in ts_cfg and \
+                    not isinstance(ts_cfg["extract_modes"], bool):
+                logger.error("'super_subjects.task_shuffle.extract_modes' "
+                             "debe ser bool (true/false).")
+                sys.exit(1)
             if len(params["tasks"]) < 2:
                 logger.error("task_shuffle requiere >= 2 tareas.")
                 sys.exit(1)
@@ -308,8 +399,65 @@ def _load_params(json_path: Path) -> dict:
                              "dinamica. Deje latent_plots.enabled=false.")
                 sys.exit(1)
             logger.info("[TASK-SHUFFLE] CONTROL NEGATIVO activo: seed=%s "
-                        "(permutacion de tareas por sujeto al armar los SS)",
-                        ts_cfg["seed"])
+                        "(permutacion de tareas por sujeto al armar los SS); "
+                        "extract_modes=%s",
+                        ts_cfg["seed"],
+                        bool(ts_cfg.get("extract_modes", False)))
+
+    # [SS-SHUFFLE] Validacion del bloque opcional de AISLAMIENTO TOTAL
+    # (results/cache/params -> <root>/ sin tocar el .env; ver
+    # _resolve_project_paths). Ausente o enabled=false => rutas de
+    # siempre, comportamiento historico exacto.
+    sss = params.get("ss_shuffle")
+    if sss is not None:
+        if not isinstance(sss, dict):
+            logger.error("'ss_shuffle' debe ser un objeto con 'enabled' "
+                         "(bool) y claves opcionales 'root_name', "
+                         "'reuse_existing_run', 'reuse_copy', "
+                         "'influence_figures', ...")
+            sys.exit(1)
+        if "enabled" in sss and not isinstance(sss["enabled"], bool):
+            logger.error("'ss_shuffle.enabled' debe ser bool (true/false).")
+            sys.exit(1)
+        if sss.get("enabled", False):
+            root = _ss_shuffle_root_name(sss)
+            if (not root or root in {".", ".."}
+                    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", root)):
+                logger.error("'ss_shuffle.root_name' debe ser un nombre de "
+                             "carpeta seguro (alfanumerico, sin rutas): %r",
+                             root)
+                sys.exit(1)
+            _ts_on = bool((ss_cfg.get("task_shuffle") or {}).get("enabled",
+                                                                   False))
+            if sss.get("reuse_existing_run", False) and not _ts_on:
+                logger.error("ss_shuffle.reuse_existing_run=true requiere "
+                             "super_subjects.task_shuffle (migra runs "
+                             "_taskshuf{seed} del arbol viejo).")
+                sys.exit(1)
+            if sss.get("influence_figures", False):
+                if not _ts_on:
+                    logger.error("ss_shuffle.influence_figures=true requiere "
+                                 "super_subjects.task_shuffle (las figuras "
+                                 "del control leen las celdas PERMUTADAS).")
+                    sys.exit(1)
+                if not _task_shuffle_extract_modes(ss_cfg):
+                    logger.error("ss_shuffle.influence_figures=true requiere "
+                                 "super_subjects.task_shuffle.extract_modes="
+                                 "true (las figuras usan el mode_map con "
+                                 "token taskshuf).")
+                    sys.exit(1)
+                _top_n = int((params.get("execution") or {}).get(
+                    "mode_extract_top_n", 0) or 0)
+                if _top_n <= 0:
+                    logger.error("ss_shuffle.influence_figures=true requiere "
+                                 "execution.mode_extract_top_n > 0 (los "
+                                 "runs reales usan 4).")
+                    sys.exit(1)
+            logger.info(
+                "[SS-SHUFFLE] AISLAMIENTO TOTAL activo: TODO ira a "
+                "results|cache|params/%s/ (el experimento real no se "
+                "toca).", root,
+            )
 
     # Validate cdhsa_params
     cdhsa = params["cdhsa_params"]
@@ -537,6 +685,20 @@ class CDHSABatchRunner:
         self.run_comparison: bool = self.exec_cfg.get("run_comparison", True)
         self.sufix = "_ec_ma_taskshuffle"
 
+        # [SS-SHUFFLE] Aislamiento total del control negativo: TODO lo
+        # que produce esta corrida (results / cache / params) vive bajo
+        # una carpeta propia (root_name) sin tocar el .env ni el
+        # experimento real. _resolve_project_paths() hace el redirije
+        # y memoriza las rutas originales para la fase de reuso.
+        self.ss_shuffle_cfg: dict = params.get("ss_shuffle") or {}
+        self.ss_shuffle_enabled: bool = bool(
+            self.ss_shuffle_cfg.get("enabled", False)
+        )
+        self.ss_shuffle_root: str = _ss_shuffle_root_name(self.ss_shuffle_cfg)
+        self._old_output_dir: Path | None = None
+        self._old_cache_dir: Path | None = None
+        self._old_params_dir: Path | None = None
+
         # Optional paths (may be None if not configured in the project)
         self.db_path: str | None = None
         self.output_dir: Path | None = None
@@ -629,6 +791,58 @@ class CDHSABatchRunner:
                 "en el .env; ver src/ntfy/README.md)",
             )
 
+        # ------------------------------------------------------------------
+        # [SS-SHUFFLE] AISLAMIENTO TOTAL: redirige TODO el arbol de
+        # salidas a <root>/ dentro de cada base (results/cache/params)
+        # y exporta las variables BASE_* al entorno del proceso para que
+        # TODOS los subprocesos (run_cdhsa, extract_mode_indices,
+        # figuras de influencia, logging de los hijos) resuelvan lo
+        # mismo: config.py hace load_dotenv() SIN override, asi que una
+        # variable ya definida le gana al .env. El .env del usuario NO
+        # se toca y el experimento real sigue yendo a sus rutas de
+        # siempre cuando se corre sin este bloque.
+        # ------------------------------------------------------------------
+        if self.ss_shuffle_enabled and self.output_dir is not None \
+                and self.cache_dir is not None and self.params_dir is not None:
+            self._old_output_dir = Path(self.output_dir)
+            self._old_cache_dir = Path(self.cache_dir)
+            self._old_params_dir = Path(self.params_dir)
+            self.output_dir = self._old_output_dir / self.ss_shuffle_root
+            self.cache_dir = self._old_cache_dir / self.ss_shuffle_root
+            self.params_dir = self._old_params_dir / self.ss_shuffle_root
+
+            os.environ["BASE_RESULTS_PATH"] = str(self.output_dir)
+            os.environ["BASE_CACHE_PATH"] = str(self.cache_dir)
+            os.environ["BASE_PARAMS_FILE"] = str(self.params_dir)
+            try:
+                from src.utils.config import LOGGING_BASE_PATH as _LBP
+                os.environ["LOGGING_BASE_PATH"] = str(
+                    Path(_LBP) / self.ss_shuffle_root
+                )
+            except Exception:
+                pass
+
+            for _d in (self.output_dir, self.cache_dir, self.params_dir):
+                try:
+                    _d.mkdir(parents=True, exist_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "[SS-SHUFFLE] No se pudo crear %s: %s", _d, exc
+                    )
+
+            logger.info("[SS-SHUFFLE] Arbol aislado del control:")
+            logger.info("  results -> %s   (antes: %s)",
+                        self.output_dir, self._old_output_dir)
+            logger.info("  cache   -> %s   (antes: %s)",
+                        self.cache_dir, self._old_cache_dir)
+            logger.info("  params  -> %s   (antes: %s)",
+                        self.params_dir, self._old_params_dir)
+            logger.info(
+                "[SS-SHUFFLE] Variables BASE_* exportadas al entorno del "
+                "batch: todos los subprocesos escribiran en el arbol "
+                "aislado (el .env no se toca)."
+            )
+
     def _resolve_log_path(self) -> Path:
         """Resolve the path for the batch CSV log file."""
         if self.output_dir:
@@ -667,6 +881,25 @@ class CDHSABatchRunner:
         logger.info("  Output dir      : %s", self.output_dir)
         logger.info("  Cache dir       : %s", self.cache_dir)
         logger.info("  Checkpoint      : %s", self._checkpoint_path())
+        if self.ss_shuffle_enabled:
+            logger.info("  ---")
+            logger.info(
+                "  [SS-SHUFFLE] AISLAMIENTO TOTAL (cero colision con el"
+                " experimento real):"
+            )
+            logger.info("    results  -> %s", self.output_dir)
+            logger.info("    cache    -> %s", self.cache_dir)
+            logger.info("    params   -> %s", self.params_dir)
+            logger.info(
+                "    reuse    : %s (copy=%s)",
+                bool(self.ss_shuffle_cfg.get("reuse_existing_run", True)),
+                bool(self.ss_shuffle_cfg.get("reuse_copy", False)),
+            )
+            logger.info(
+                "    figuras  : %s (script: %s)",
+                bool(self.ss_shuffle_cfg.get("influence_figures", False)),
+                self._influence_figures_script_path(),
+            )
         logger.info("  ---")
         if is_multi_ss:
             logger.info("  Super-subjects  : %d", n_ss)
@@ -676,8 +909,9 @@ class CDHSABatchRunner:
             _ts_banner = _task_shuffle_seed(self.ss_cfg)
             if _ts_banner is not None:
                 logger.info("  Task shuffle    : seed=%d (CONTROL NEGATIVO:"
-                            " tareas permutadas por sujeto en cada SS)",
-                            _ts_banner)
+                            " tareas permutadas por sujeto en cada SS);"
+                            " extract_modes=%s", _ts_banner,
+                            _task_shuffle_extract_modes(self.ss_cfg))
         else:
             logger.info(
                 "  Super-subjects  : %d  -> %s",
@@ -909,6 +1143,24 @@ class CDHSABatchRunner:
                     label, job["session"],
                 )
                 continue
+
+            # [TASK-SHUFFLE] Red de seguridad para el control negativo:
+            # si cdhsa_arrays.npz YA esta en el out_dir de este job
+            # (migrado por la fase de reuso o dejado por una corrida
+            # previa), el job esta hecho aunque el checkpoint no lo
+            # sepa. Evita re-entrenar ~6 h por un checkpoint malogrado.
+            # Solo aplica a jobs del control (seed de permutacion): el
+            # nombre del out_dir codifica config+seed, asi que arrays
+            # presentes = corrida completa con ESTA configuracion.
+            if _task_shuffle_seed(job.get("ss_cfg")) is not None:
+                _out = self._get_output_dir(job)
+                if (_out / "cdhsa_arrays.npz").exists():
+                    logger.info(
+                        "SKIP (arrays ya en disco): %s", _out
+                    )
+                    self.checkpoint.add(key)
+                    continue
+
             todo.append(job)
 
         if skipped := len(jobs) - len(todo):
@@ -1539,6 +1791,23 @@ class CDHSABatchRunner:
     # Post-processing: extract mode indices JSON
     # ------------------------------------------------------------------
 
+    def _mode_map_json_name(self, job: dict, top_n: int) -> str:
+        """Nombre del mode_map para un job (con token taskshuf si aplica).
+
+        Debe mantenerse sincronizado con
+        ``src.cdhsa.extract_mode_indices`` y con la fase de figuras
+        (``_run_influence_figures``): el token ``_taskshuf{seed}``
+        evita sobreescribir el mode_map del run real en params_dir.
+        """
+        tasks_tag = "_".join(job["tasks"])
+        tw_tag = f"{job['t_start']}s-{job['t_end']}s"
+        _ts = _task_shuffle_seed(job.get("ss_cfg"))
+        _ts_tok = f"_taskshuf{_ts}" if _ts is not None else ""
+        return (
+            f"mode_map_{top_n}_modes_{job['session']}_{tasks_tag}_"
+            f"{tw_tag}{_ts_tok}.json"
+        )
+
     def _run_mode_extraction(self) -> None:
         """Run src.cdhsa.extract_mode_indices for every job with results.
 
@@ -1571,15 +1840,20 @@ class CDHSABatchRunner:
         for job in self.all_jobs:
             out_dir = self._get_output_dir(job)
 
-            # [TASK-SHUFFLE] El control negativo NO extrae modos: los
-            # modos especificos del run permutado no tienen
-            # interpretacion dinamica y el mode_map sobreescribiria el
-            # del run real (mismo nombre de fichero en params_dir).
+            # [TASK-SHUFFLE] Gate del control negativo: por defecto NO
+            # se extraen modos en runs con shuffle (etiquetas de
+            # condicion nominales y el mode_map compartiria nombre de
+            # fichero con el del run real en params_dir). Opt-in via
+            # super_subjects.task_shuffle.extract_modes=true: la
+            # extraccion corre con token taskshuf{seed} en el nombre.
             _ts_extract = _task_shuffle_seed(job.get("ss_cfg"))
-            if _ts_extract is not None:
+            if _ts_extract is not None and \
+                    not _task_shuffle_extract_modes(job.get("ss_cfg")):
                 logger.info(
                     "  EXTRACT | SKIP (task_shuffle seed=%d): control "
-                    "negativo sin extraccion de modos", _ts_extract)
+                    "negativo sin extraccion de modos (active "
+                    "super_subjects.task_shuffle.extract_modes=true para "
+                    "extraerlos con sufijo taskshuf)", _ts_extract)
                 n_skip += 1
                 continue
 
@@ -1591,12 +1865,16 @@ class CDHSABatchRunner:
                 n_skip += 1
                 continue
 
-            # Build a descriptive output filename
-            tasks_tag = "_".join(job["tasks"])
-            tw_tag = f"{job['t_start']}s-{job['t_end']}s"
-            json_name = (
-                f"mode_map_{top_n}_modes_{job['session']}_{tasks_tag}_{tw_tag}.json"
-            )
+            # Build a descriptive output filename (token taskshuf para
+            # el control: no colisiona con el mode_map del run real)
+            json_name = self._mode_map_json_name(job, top_n)
+            if _ts_extract is not None:
+                logger.warning(
+                    "  [TASK-SHUFFLE] mode_map del CONTROL NEGATIVO: "
+                    "las etiquetas de condicion son NOMINALES (celdas = "
+                    "mezcla aleatoria de tareas); usar solo para "
+                    "inspeccion, nunca como mapa de modos por tarea."
+                )
             json_out = self.params_dir / json_name
 
             # Build command to run the extraction script as a module
@@ -1672,6 +1950,339 @@ class CDHSABatchRunner:
                 "revisa el traceback en la seccion 'EXTRAYENDO INDICES "
                 "DE MODOS ESPECIFICOS' del log." % (n_fail, n_ok + n_fail),
                 title="[CD-HSA] Extraccion de modos FALLO",
+            )
+
+        return n_ok, n_skip, n_fail
+
+    # ==================================================================
+    # [SS-SHUFFLE] Reuso + figuras de influencia del control negativo
+    # ==================================================================
+
+    def _influence_figures_script_path(self) -> Path:
+        """Ruta al script de figuras (overridable desde el JSON)."""
+        custom = self.ss_shuffle_cfg.get("influence_figures_script")
+        if custom:
+            return Path(str(custom)).expanduser()
+        # <repo_root>/scripts/analyze_channel_influence_taskshuffle.py
+        return _SCRIPT_DIR.parent.parent / "scripts" / \
+            "analyze_channel_influence_taskshuffle.py"
+
+    def _ss_shuffle_reuse_phase(self) -> None:
+        """[SS-SHUFFLE] Fase 0: reuso de lo ya calculado, sin recalcular.
+
+        Si el control ya se corrio antes con la misma seed (p.ej. la
+        corrida v4 con seed 20261022 que vive en el arbol REAL bajo
+        ``results/cdhsa/..._taskshuf{seed}``), la MIGRA (mueve, o copia
+        con ``reuse_copy=true``) al arbol aislado ANTES de decidir si
+        hay que computar algo:
+
+        * results-dir del control  -> results/<root>/cdhsa/...
+        * mode_map con token       -> params/<root>/ (si existia)
+        * checkpoint key del job   -> cache/<root>/batch_checkpoint_...
+
+        Con los arrays ya en el arbol aislado, ``_filter_todo`` salta
+        el job (red de seguridad): cero riesgo de re-entrenar ~6 h.
+
+        Guardia paranoica: SOLO se toca un directorio cuyo nombre
+        termina EXACTAMENTE en ``_taskshuf{seed}`` (imposible migrar
+        un run real por accidente).
+        """
+        if not self.ss_shuffle_enabled:
+            return
+        iso = self.ss_shuffle_cfg
+        if not iso.get("reuse_existing_run", True):
+            logger.info(
+                "[SS-SHUFFLE] reuse_existing_run=false: no se migra nada "
+                "del arbol viejo (todo se computa de cero si falta)."
+            )
+            return
+        if self._old_output_dir is None or self.output_dir is None:
+            return
+
+        copy = bool(iso.get("reuse_copy", False))
+        keys_done: list[str] = []
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("  [SS-SHUFFLE] REUSO: migrar lo ya calculado al arbol aislado")
+        logger.info("=" * 70)
+
+        top_n = int(
+            (self.params.get("execution") or {}).get("mode_extract_top_n", 0)
+            or 0
+        )
+
+        for job in self.all_jobs:
+            seed = _task_shuffle_seed(job.get("ss_cfg"))
+            if seed is None:
+                continue  # solo jobs del control se migran
+            out_dir = self._get_output_dir(job)
+            label = job.get(
+                "super_subject_label",
+                f"multi-SS(S={job.get('n_super_subjects', '?')})",
+            )
+
+            if (out_dir / "cdhsa_arrays.npz").exists():
+                logger.info(
+                    "  REUSE | %s/%s: ya esta en el arbol aislado -> nada "
+                    "que migrar", label, job["session"],
+                )
+                continue
+
+            try:
+                rel = out_dir.relative_to(self.output_dir)
+            except ValueError:
+                continue
+            old_out_dir = self._old_output_dir / rel
+
+            if not (old_out_dir / "cdhsa_arrays.npz").exists():
+                logger.info(
+                    "  REUSE | %s/%s: sin run previo en %s -> se computara "
+                    "de cero", label, job["session"], old_out_dir,
+                )
+                continue
+
+            if not old_out_dir.name.endswith(f"_taskshuf{seed}"):
+                logger.warning(
+                    "  REUSE | [GUARDIA] %s no termina en _taskshuf%d: NO "
+                    "se migra (por seguridad).", old_out_dir, seed,
+                )
+                continue
+
+            logger.info(
+                "  REUSE | %s/%s: migrando run previo (reuso, sin "
+                "recalcular)", label, job["session"],
+            )
+            logger.info("    %s", old_out_dir)
+            logger.info("    %s", out_dir)
+            try:
+                out_dir.parent.mkdir(parents=True, exist_ok=True)
+                if copy:
+                    shutil.copytree(old_out_dir, out_dir, dirs_exist_ok=True)
+                elif out_dir.exists():
+                    # Destino parcial preexistente: no arriesgar el
+                    # move-into; fusionar copiando y conservar el original.
+                    logger.warning(
+                        "    [AVISO] destino parcial existente; copiando y "
+                        "fusionando (el original se conserva)."
+                    )
+                    shutil.copytree(old_out_dir, out_dir, dirs_exist_ok=True)
+                else:
+                    shutil.move(str(old_out_dir), str(out_dir))
+            except (OSError, shutil.Error) as exc:
+                logger.error(
+                    "  REUSE | [FALLO] migrando %s: %s", old_out_dir, exc,
+                )
+                continue
+
+            keys_done.append(self._checkpoint_key(job))
+
+            if (out_dir / "hankel_matrices.npz").exists():
+                logger.info(
+                    "    [OK] hankel_matrices.npz presente (figuras de "
+                    "influencia posibles)"
+                )
+            else:
+                logger.warning(
+                    "    [AVISO] sin hankel_matrices.npz: las figuras de "
+                    "influencia fallaran (run incompleto)."
+                )
+
+            # mode_map viejo con token taskshuf -> params aislado
+            if top_n > 0 and self.params_dir is not None:
+                mm_name = self._mode_map_json_name(job, top_n)
+                old_mm = self._old_params_dir / mm_name
+                new_mm = self.params_dir / mm_name
+                if not new_mm.is_file() and old_mm.is_file():
+                    logger.info(
+                        "  REUSE | %s/%s: migrando mode_map previo",
+                        label, job["session"],
+                    )
+                    logger.info("    %s", old_mm)
+                    logger.info("    %s", new_mm)
+                    try:
+                        self.params_dir.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(old_mm, new_mm)
+                    except OSError as exc:
+                        logger.warning(
+                            "  REUSE | [FALLO] migrando mode_map: %s", exc
+                        )
+
+        if keys_done:
+            # Arrays en disco = job hecho: la clave viaja al checkpoint
+            # aislado (auto-sanado aunque el checkpoint viejo falte).
+            self.checkpoint.update(keys_done)
+            self._save_checkpoint()
+            logger.info(
+                "  REUSE | checkpoint aislado actualizado: %d clave(s) "
+                "anadida(s) -> %s", len(keys_done), self._checkpoint_path(),
+            )
+        else:
+            logger.info(
+                "  REUSE | nada migrado (todo ya estaba o no habia run "
+                "previo compatible)."
+            )
+
+    def _run_influence_figures(self) -> tuple[int, int, int] | None:
+        """[SS-SHUFFLE] Fase final: figuras de influencia de canales.
+
+        Para cada job del control negativo con resultados: dibuja la
+        influencia de los canales ORIGINALES sobre los modos COMUNES
+        (A6/W0) y los ESPECIFICOS (Step D) de cada (SS, celda), usando
+        las celdas PERMUTADAS con las que el control entreno
+        (hankel_matrices.npz) via
+        ``scripts/analyze_channel_influence_taskshuffle.py``::
+
+            <results-dir>/channel_influence_taskshuf{seed}/
+                common_mode_projection.png      (series de los comunes)
+                common_variance_explained.png    (varianza comunes)
+                common_channel_influence.png     (heatmap, TODOS los comunes)
+                common_channel_influence_topo.png
+                channel_influence.png            (top-n especificos)
+                ... + _data.npz + analysis.json
+                summary_channel_influence.json   (marcador de completado)
+
+        Skip automatico si el marcador ya existe (salvo
+        ``figures_force=true``). Esta fase NO compara con corridas
+        reales: la comparacion visual la hace usted despues.
+        """
+        iso = self.ss_shuffle_cfg
+        if not (self.ss_shuffle_enabled and iso.get("influence_figures", False)):
+            return None
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("  [SS-SHUFFLE] FIGURAS DE INFLUENCIA DE CANALES (CONTROL)")
+        logger.info("=" * 70)
+
+        script = self._influence_figures_script_path()
+        if not script.is_file():
+            logger.error(
+                "  [FIGS] no existe el script: %s", script,
+            )
+            logger.error(
+                "  [FIGS] instale scripts/analyze_channel_influence_"
+                "taskshuffle.py (incluido en el paquete) o indique la "
+                "ruta con ss_shuffle.influence_figures_script."
+            )
+            self._notify(
+                "error",
+                "Las figuras de influencia NO se generaron: falta %s" % script,
+                title="[CD-HSA] Figuras de influencia FALLO",
+            )
+            return (0, 0, 1)
+
+        top_n = int(
+            (self.params.get("execution") or {}).get("mode_extract_top_n", 0)
+            or 0
+        )
+        force = bool(iso.get("figures_force", False))
+        no_topo = bool(iso.get("figures_no_topo", False))
+        top_k_series = iso.get("figures_top_k_series")
+        top_k_topo = iso.get("figures_top_k_topo")
+
+        n_ok = 0
+        n_skip = 0
+        n_fail = 0
+
+        for job in self.all_jobs:
+            seed = _task_shuffle_seed(job.get("ss_cfg"))
+            if seed is None:
+                continue  # solo jobs del control
+            label = job.get(
+                "super_subject_label",
+                f"multi-SS(S={job.get('n_super_subjects', '?')})",
+            )
+            out_dir = self._get_output_dir(job)
+            fig_dir = out_dir / f"channel_influence_taskshuf{seed}"
+            marker = fig_dir / "summary_channel_influence.json"
+
+            if marker.is_file() and not force:
+                logger.info(
+                    "  FIGS | SKIP (ya generadas): %s", fig_dir,
+                )
+                n_skip += 1
+                continue
+
+            if not (out_dir / "cdhsa_arrays.npz").exists():
+                logger.error(
+                    "  FIGS | FALTA cdhsa_arrays.npz: %s", out_dir,
+                )
+                n_fail += 1
+                continue
+
+            mode_map = self.params_dir / self._mode_map_json_name(job, top_n) \
+                if self.params_dir else None
+            if mode_map is None or not mode_map.is_file():
+                logger.error(
+                    "  FIGS | FALTA mode_map (extraccion fallo?): %s",
+                    mode_map,
+                )
+                n_fail += 1
+                continue
+
+            cmd = [
+                sys.executable, str(script),
+                "--results-dir", str(out_dir),
+                "--top-n", str(top_n),
+                "--mode-map", str(mode_map),
+            ]
+            if top_k_series is not None:
+                cmd.extend(["--top-k-series", str(top_k_series)])
+            if top_k_topo is not None:
+                cmd.extend(["--top-k-topo", str(top_k_topo)])
+            if no_topo:
+                cmd.append("--no-topo")
+
+            logger.info(
+                "  FIGS | %s/%s -> %s", label, job["session"], fig_dir,
+            )
+            logger.debug("CMD: %s", " ".join(cmd))
+
+            try:
+                child_env = os.environ.copy()
+                child_env["PYTHONUNBUFFERED"] = "1"
+
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=child_env,
+                )
+                for line in proc.stdout:
+                    logger.info("  [FIGS] %s", line.rstrip())
+                proc.wait()
+
+                if proc.returncode == 0 and marker.is_file():
+                    logger.info("  [OK] %s", fig_dir)
+                    n_ok += 1
+                else:
+                    logger.error(
+                        "  [FAIL] figuras de %s/%s (rc=%d, marcador=%s)",
+                        label, job["session"], proc.returncode,
+                        marker.is_file(),
+                    )
+                    n_fail += 1
+            except Exception as exc:
+                logger.error(
+                    "  [FAIL] figuras de %s/%s: %s",
+                    label, job["session"], exc,
+                )
+                n_fail += 1
+
+        logger.info("")
+        logger.info(
+            "  Figuras de influencia completadas: OK=%d, Skip=%d, Fail=%d",
+            n_ok, n_skip, n_fail,
+        )
+        if n_fail > 0:
+            self._notify(
+                "error",
+                "Las figuras de influencia fallaron para %d job(s) del "
+                "control.\nRevisa el log (seccion 'FIGURAS DE INFLUENCIA "
+                "DE CANALES')." % n_fail,
+                title="[CD-HSA] Figuras de influencia FALLO",
             )
 
         return n_ok, n_skip, n_fail
@@ -2559,6 +3170,12 @@ class CDHSABatchRunner:
             logger.error("No se generaron jobs. Revisa el JSON de parametros.")
             return 1
 
+        # [SS-SHUFFLE] Fase 0: reuso. Migra al arbol aislado el run del
+        # control que ya se calculo en el arbol viejo (results/cdhsa/
+        # ..._taskshuf{seed}) ANTES de decidir que falta por computar,
+        # y sana el checkpoint aislado con las claves migradas.
+        self._ss_shuffle_reuse_phase()
+
         todo = self._filter_todo(self.all_jobs)
         total = len(todo)
 
@@ -2596,6 +3213,11 @@ class CDHSABatchRunner:
             if self.run_latent_phase:
                 latent_res = self._run_latent_phase()
 
+            # [SS-SHUFFLE] Fase final: figuras de influencia de canales
+            # (control negativo; NO compara con corridas reales).
+            fig_res = self._run_influence_figures()
+            _fig_fail_0 = fig_res[2] if fig_res is not None else 0
+
             # [LATENT] rc: la rama "ya completo" ahora hace trabajo real
             # (la fase latente); su fallo debe reflejarse en el exit code.
             _latent_fail_0 = (
@@ -2604,10 +3226,11 @@ class CDHSABatchRunner:
                 else (1 if latent_res is not None else 0)
             )
             self._notify(
-                "info" if (n_fail_x == 0 and _latent_fail_0 == 0) else "warning",
+                "info" if (n_fail_x == 0 and _latent_fail_0 == 0
+                           and _fig_fail_0 == 0) else "warning",
                 "No habia jobs pendientes (checkpoint): solo se ejecuto el "
                 "post-procesamiento (extraccion de modos + comparacion%s).\n"
-                "Extraccion de modos: OK=%d, Skip=%d, Fail=%d%s" % (
+                "Extraccion de modos: OK=%d, Skip=%d, Fail=%d%s%s" % (
                     " + fase latente" if latent_res is not None else "",
                     n_ok_x, n_skip_x, n_fail_x,
                     ("\nFase latente: OK=%d | Fallos=%d" % (
@@ -2615,10 +3238,13 @@ class CDHSABatchRunner:
                     )) if latent_res is not None and latent_res["ran"] else
                     ("\nFase latente: no ejecutada (%s)" % latent_res["reason"])
                     if latent_res is not None else "",
+                    ("\nFiguras de influencia: OK=%d | Skip=%d | Fallos=%d" % (
+                        fig_res[0], fig_res[1], fig_res[2],
+                    )) if fig_res is not None else "",
                 ),
                 title="[CD-HSA] Batch ya completo",
             )
-            return 0 if _latent_fail_0 == 0 else 1
+            return 0 if (_latent_fail_0 == 0 and _fig_fail_0 == 0) else 1
 
         logger.info("Total a ejecutar: %d / %d", total, len(self.all_jobs))
 
@@ -2650,9 +3276,20 @@ class CDHSABatchRunner:
         if self.run_latent_phase:
             latent_res = self._run_latent_phase()
 
+        # [SS-SHUFFLE] Fase final: figuras de influencia de canales
+        # (control negativo; NO compara con corridas reales: la
+        # comparacion visual la hace usted despues).
+        fig_res = self._run_influence_figures()
+        _fig_fail = fig_res[2] if fig_res is not None else 0
+        _fig_summary = (
+            ("\nFiguras de influencia: OK=%d | Skip=%d | Fallos=%d" % (
+                fig_res[0], fig_res[1], fig_res[2],
+            )) if fig_res is not None else ""
+        )
+
         # [NTFY] Final notice (after post-processing): success only when
         # not a single job failed AND the mode extraction AND the latent
-        # phase succeeded.
+        # phase AND the figures succeeded.
         _elapsed = time.strftime(
             "%Hh %Mm %Ss", time.gmtime(time.time() - _batch_t0),
         )
@@ -2675,18 +3312,20 @@ class CDHSABatchRunner:
                 )
         _resumen = (
             "OK: %d | Fallos: %d | Total: %d\n"
-            "Extraccion de modos: OK=%d, Skip=%d, Fail=%d%s\n"
+            "Extraccion de modos: OK=%d, Skip=%d, Fail=%d%s%s\n"
             "Duracion: %s\nLabel: %s\n"
             "Host: %s\nSalidas: %s" % (
                 completed, failed, total,
                 n_ok_x, n_skip_x, n_fail_x,
                 _latent_summary,
+                _fig_summary,
                 _elapsed,
                 self.params.get("experiment_label", "batch_cdhsa"),
                 _HOST, self.output_dir,
             )
         )
-        if failed == 0 and n_fail_x == 0 and _latent_fail == 0:
+        if failed == 0 and n_fail_x == 0 and _latent_fail == 0 \
+                and _fig_fail == 0:
             self._notify("success", _resumen, title="[CD-HSA] Batch terminado OK")
         else:
             self._notify(
@@ -2695,7 +3334,8 @@ class CDHSABatchRunner:
                 title="[CD-HSA] Batch terminado CON FALLOS",
             )
 
-        return 0 if (failed == 0 and n_fail_x == 0 and _latent_fail == 0) else 1
+        return 0 if (failed == 0 and n_fail_x == 0 and _latent_fail == 0
+                     and _fig_fail == 0) else 1
 
     def _run_sequential(self, todo: list[dict], total: int) -> tuple[int, int]:
         completed = 0

@@ -1,7 +1,6 @@
 {
   "experiment_label": "multiss_cdhsa_5ss_taskshuffle_control_seed20261023",
-  "_comment_experiment": "CONTROL NEGATIVO (task-shuffle) del experimento ec_ma/ec_mu v5 (var99c100 + a6_max_common=5). MISMO pipeline y MISMOS parametros que el run real; UNICA diferencia: al armar cada super-sujeto, las C grabaciones de cada sujeto se reparten ALEATORIAMENTE entre las C celdas (permutacion por sujeto, seed fija, trazable en hankel_info.json). Cada celda queda como mezcla aleatoria de tareas y las etiquetas de condicion pasan a ser nominales. Esperado si el metodo es sano: Step D/LOSO nulos o ruido puro, F-tests del Step B ~1, backbone (W0/lambda/r0) casi identico al real. Ver README_TASK_SHUFFLE.md y scripts/compare_task_shuffle.py.",
-  "_comment_v5": "Re-entreno r0-fix (post-mortem 2026-10-19). (1) a6_max_common=5: A6 testea solo los 5 primeros candidatos y r0 queda acotado a 5 — fix de la canibalizacion (con a6_max_common=0 el nulo Haar liberal + espectro saturado declaraba comunes las 30 direcciones del pool: r0=30 censurado, y W0 se tragaba la banda ~1-2%/modo donde vive lo discriminativo). El pool de A1-A5 se sigue computando con el tope por defecto (max_common=30); lo que se acota es la decision de A6. (2) var_max_rank=100: los rangos locales quedaron censurados 10/10 a cap 50 (sin garantia de 99%, quizas ni 90%, de varianza) y la banda especifica ni entraba en las bases locales; con 100 el Step D tiene de donde elegir. AVISOS: el warning 'r0 = max_common, el backbone esta censurado' es ESPERADO (truncamiento deliberado); el Step B opera sobre W0 => testea solo 5 modos comunes (los F-tests de W6+ del baseline quedan en los logs viejos); d_loso=true es el gate pre-registrado del experimento: si el fix funciona, el LOSO debe volver positivo — si la clasificacion mejora pero el LOSO sigue <=0, la causa seria H2 (generalizacion sesion->sesion), no canibalizacion.",
+  "_comment_experiment": "CONTROL NEGATIVO (task-shuffle) del experimento ec_mu con los MISMOS parametros del baseline v4 (var99c50 + a6_max_common=0): es el nul companero del run real v4. UNICA diferencia: al armar cada super-sujeto, las C grabaciones de cada sujeto se reparten ALEATORIAMENTE entre las C celdas (permutacion por sujeto, seed fija, trazable en hankel_info.json). Esperado si el metodo es sano: Step D/LOSO nulos, F-tests del Step B ~1, backbone (W0/lambda/r0) identico al real. TODO-EN-UNO: una sola corrida del batch produce train (o REUSA el v4 ya calculado) + mode_map + figuras de influencia de canales, todo dentro del arbol aislado ss_shufle (ver bloque ss_shuffle).",
   "super_subjects": {
     "n_super_subjects": 5,
     "subjects_per_super_subject": 12,
@@ -10,8 +9,19 @@
     "task_shuffle": {
       "enabled": true,
       "seed": 20261023,
-      "_comment": "Control negativo: permutacion within-subject de las tareas al armar los SS. Ausente o enabled=false => comportamiento historico exacto (sin permutar). La seed genera la asignacion determinista; el out_dir y la checkpoint key reciben el token taskshuf{seed} (no colisionan con el run real)."
+      "extract_modes": true,
+      "_comment": "Control negativo: permutacion within-subject de las tareas al armar los SS. Ausente o enabled=false => comportamiento historico exacto (sin permutar). La seed genera la asignacion determinista; el out_dir y la checkpoint key reciben el token taskshuf{seed} (no colisionan con el run real). extract_modes=true: el mode_map del control se genera al final del batch con sufijo taskshuf{seed} (etiquetas de condicion NOMINALES: celdas = mezcla aleatoria de tareas)."
     }
+  },
+  "ss_shuffle": {
+    "enabled": true,
+    "root_name": "ss_shufle",
+    "reuse_existing_run": true,
+    "reuse_copy": false,
+    "influence_figures": true,
+    "figures_force": false,
+    "figures_no_topo": false,
+    "_comment": "AISLAMIENTO TOTAL del control negativo (TODO-EN-UNO, cero colision con el experimento real). enabled=true redirige TODO lo que va en results/cache/params a <base>/ss_shufle/ (results/ss_shufle/, cache/ss_shufle/, params/ss_shufle/) y exporta BASE_* al entorno para que todos los subprocesos escriban ahi (el .env no se toca). reuse_existing_run=true: ANTES de computar, migra el run v4 ya calculado (results/cdhsa/..._taskshuf20261022) al arbol aislado (mueve; reuse_copy=true copia) -> no recalcula NADA de lo ya hecho. influence_figures=true: fase final que genera las imagenes de influencia de los canales originales sobre los modos COMUNES y los ESPECIFICOS de cada (SS, celda), desde las celdas PERMUTADAS (channel_influence_taskshuf{seed}/ dentro del results-dir del control). figures_force=true las regenera aunque existan. figures_no_topo=true desactiva los topoplots."
   },
   "sessions": [
     "session1"
@@ -51,18 +61,17 @@
     "skip_bc": false,
     "skip_tangent": false,
     "skip_d": false,
-    "_comment_costs": "Coste v5: A6 testea 5 candidatos (~6x mas barato que el baseline de 30); el sobrecoste de var_max_rank=100 cae en A2 (svds hasta 100 triplets en vez de 50, ~2x esa fase) y en el tangente (~1.5-2x): espere ~1.3-1.8x el wall-clock del baseline (~13 h/experimento, en paralelo como siempre). Si el summary vuelve a reportar censo a cap 100, las bases locales siguen sin llegar al 99%: sopesar subir mas (coste ~cuadratico y cada dimension extra anade ruido especifico por sujeto al pool del Step D). El nulo 'hankel' (a6_null_type) cuesta ~10-15 min POR replica en este protocolo: usar solo para la comparacion final del paper con pocas replicas (20-100) o planificar n_null=500+ para la inferencia final.",
-    "_comment_nulos": "Para la comparacion Haar vs Hankel-preservante prometida en la Seccion 7: cambiar a6_null_type a 'hankel' (el pipeline autodetecta el row_block desde hankel_depth). NO cambiar de nulo a mitad de un analisis: declararlo a priori como en el paper."
+    "_comment_costs": "Params v4 (baseline): r0 quedara censurado en 30 (canibalizacion) y los rangos locales censurados a cap 50 — es lo esperado en el control, que replica la maquinaria tal cual del run al que acompana. NO cambiar estos parametros sin cambiar tambien la seed: el reuso (migracion del v4) solo aplica cuando la configuracion produce el MISMO out_dir (el nombre del directorio codifica config+seed)."
   },
   "latent_plots": {
     "enabled": false,
-    "_comment": "OFF para el control negativo: la fase latente re-carga por tarea y los modos especificos del run permutado no tienen interpretacion dinamica. La extraccion de modos tambien se salta automaticamente (gate en run_batch_cdhsa)."
+    "_comment": "OFF para el control negativo (obligatorio): la fase latente re-carga por tarea y reconstruiria SS distintos a los del run permutado. Las imagenes equivalentes (comunes + especificos por SS) las genera la fase de figuras del bloque ss_shuffle desde las celdas PERMUTADAS, que es lo correcto para el control."
   },
   "execution": {
     "max_workers": 1,
     "delay": 0.0,
     "run_comparison": false,
-    "mode_extract_top_n": 0,
-    "_comment_exec": "mode_extract_top_n=0: la extraccion de modos se salta automaticamente para jobs con task_shuffle (gate del batch)."
+    "mode_extract_top_n": 4,
+    "_comment_exec": "mode_extract_top_n=4 (igual que los runs reales): con task_shuffle.extract_modes=true el mode_map del control se extrae al final del batch con el token taskshuf{seed} en el nombre (params/ss_shufle/). run_comparison=false: el control no se compara con nada dentro del script (la comparacion con los runs reales es VISUAL y la hace usted despues)."
   }
 }
