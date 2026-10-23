@@ -1,49 +1,61 @@
 #!/usr/bin/env python3
 """Regenera SOLO los topoplots de influencia de canales sobre los modos
-especificos (Step D) a partir de los resultados ya guardados.
+especificos (Step D) a partir de los resultados ya guardados.  (v2)
 
 Problema que resuelve
 ---------------------
-El pipeline guarda en cada carpeta de job (SS x condicion):
+Tanto el pipeline de latentes (runs reales) como el analizador del control
+negativo task-shuffle (``analyze_channel_influence_taskshuffle.py``) guardan
+en cada carpeta de job/celda:
 
 * ``channel_influence_data.npz``  — pesos de influencia (n_ch, n_spec),
   ``ch_names`` y ``latent_dim_labels``.  ESTE ARCHIVO ES CORRECTO.
-* ``channel_influence.png``       — la figura.  En la version actual del
-  servidor es un HEATMAP (canales x modos, estilo
-  "Channel influence on condition-specific modes (D)") en lugar de los
-  TOPOPLOTS ("cerebritos") que ya usa la imagen de modos comunes
-  (``common_channel_influence_topo.png``).
+* ``channel_influence.png``       — la figura.  Es un HEATMAP (canales x
+  modos, estilo "Channel influence on condition-specific modes (D)") en
+  lugar de los TOPOPLOTS ("cerebritos") que ya usa la imagen de modos
+  comunes (``common_channel_influence_topo.png``).
 
-Este script NO re-corre el pipeline: lee el ``.npz`` existente y genera la
-figura que falta, con el MISMO estilo que la de modos comunes
-(``plot_topomap_grid``: 1 fila, RdBu_r simetrico, colorbar por panel):
+Este script NO re-corre nada: lee los datos existentes y genera la figura que
+falta, con el MISMO estilo que la de modos comunes (``plot_topomap_grid``:
+1 fila, RdBu_r simetrico, colorbar por panel):
 
 * salida por defecto:  ``channel_influence_topo.png``  (no toca el heatmap)
 * con ``--overwrite``:  tambien sobreescribe ``channel_influence.png``
 
-Etiquetas: ``SM{j}`` (mas ``(lambda=...)`` si hay lambda disponible via
-``--mode-map`` o ``--lambdas``).
+Layouts soportados (v2)
+-----------------------
+1. Runs reales (fase latente del batch): raiz
+   ``.../test_retest_gedai_super_subject*/super_subject-XX/sessionN/`` con
+   carpetas ``fromXs_toYs_<task>`` (la condicion sale del nombre).
+
+2. Control negativo task-shuffle (``analyze_channel_influence_taskshuffle``):
+   raiz ``.../fromXs_toYs_<t1>_<t2>_taskshuf<seed>/channel_influence_taskshuf<seed>/``
+   con carpetas de celda ``ss{n}_c{c}_{task}`` (5 SS x 2 celdas = 10
+   imagenes).  La condicion (etiqueta NOMINAL de la celda) sale del nombre;
+   los lambda vienen del mode_map del control en ``params/ss_shufle/``.
+
+Si el ``.npz`` no se llama exactamente ``channel_influence_data.npz``, el
+script hace introspeccion de los ``.npz`` chicos (excluyendo los
+``*common*``, que son los modos comunes) y de los ``analysis.json``,
+buscando la matriz (n_ch, n_modes) + los nombres de canales; si no
+encuentra nada, imprime el contenido de las carpetas para diagnosticar.
 
 Uso
 ---
-    # un experimento (10 carpetas -> 10 imagenes):
-    python scripts/regen_specific_influence_topo.py <root_resultados_ec_mu> \
-        --mode-map params/mode_map_4_modes_session1_eyesclosed_music_100.0s-200.0s.json
+    # control negativo (10 imagenes):
+    python scripts/regen_specific_influence_topo.py \\
+        results/ss_shufle/cdhsa/session1/nSS5_.../from100.0s_to200.0s_eyesclosed_mathematic_taskshuf20261022/channel_influence_taskshuf20261022 \\
+        --mode-map params/ss_shufle/mode_map_4_modes_session1_eyesclosed_mathematic_100.0s-200.0s_taskshuf20261022.json
 
-    # los dos experimentos:
-    python scripts/regen_specific_influence_topo.py <root_ec_mu> <root_ec_ma> ...
+    # runs reales (fase latente):
+    python scripts/regen_specific_influence_topo.py <root_latente> [--mode-map ...]
 
-    # sin lambda (si el mode_map ya no existe):
-    python scripts/regen_specific_influence_topo.py <root> --lambdas 0.998,0.997,0.997,0.997
+    # sin lambda (etiquetas SM0..SM{m-1}):  omitir --mode-map / --lambdas
+    # reemplazar ademas el heatmap:           --overwrite
+    # ver que haria sin escribir nada:       --dry-run
 
-    # reemplazar ademas el heatmap:
-    python scripts/regen_specific_influence_topo.py <root> --overwrite
-
-    # ver que haria sin escribir nada:
-    python scripts/regen_specific_influence_topo.py <root> --dry-run
-
-Dependencias: numpy, matplotlib, mne  (las del repo).  No importa nada del
-repo: se puede correr desde cualquier lado.
+Dependencias: numpy, matplotlib, mne.  No importa nada del repo: se puede
+correr desde cualquier lado.
 """
 from __future__ import annotations
 
@@ -206,18 +218,220 @@ def lambdas_from_mode_map(mode_map_path: str, condition: str):
     return [float(l) for l in lams]
 
 
-def condition_from_dirname(folder: str) -> str | None:
-    """Extrae la condicion del nombre de la carpeta de ventana.
+# ---------------------------------------------------------------------------
+# Nombres de carpeta -> (condicion, super-sujeto) en ambos layouts
+# ---------------------------------------------------------------------------
 
-    ``from100.0s_to200.0s_eyesclosed`` -> ``eyesclosed``.
-    El pipeline de latentes corre UNA condicion por job => el token
-    final es la condicion de ESTE job.
+def condition_from_dirname(folder: str) -> str | None:
+    """Extrae la condicion del nombre de la carpeta.
+
+    Layout latente:  ``from100.0s_to200.0s_eyesclosed`` -> ``eyesclosed``
+    Layout control:  ``ss1_c1_eyesclosed``              -> ``eyesclosed``
+    (en el control task-shuffle la etiqueta es NOMINAL: la celda es una
+    mezcla aleatoria de tareas; la mezcla real esta en cada analysis.json).
     """
     base = os.path.basename(os.path.normpath(folder))
     m = re.match(r"^from[\d.]+s_to[\d.]+s_(.+)$", base)
-    if not m:
+    if m:
+        return m.group(1)
+    m = re.match(r"^ss\d+_c\d+_(.+)$", base)
+    if m:
+        return m.group(1)
+    return None
+
+
+def _ss_label_from_dirname(folder: str) -> str | None:
+    """``.../ss1_c1_eyesclosed`` -> ``ss1`` (layout control task-shuffle)."""
+    base = os.path.basename(os.path.normpath(folder))
+    m = re.match(r"^(ss\d+)_c\d+_", base)
+    return m.group(1) if m else None
+
+
+# ---------------------------------------------------------------------------
+# Descubrimiento de los datos de influencia (canonico + fallbacks)
+# ---------------------------------------------------------------------------
+
+_WEIGHT_KEY_PREFS = ("influence_weights", "weights", "W_influence",
+                     "channel_influence", "specific_weights", "influence",
+                     "W")
+_CHNAMES_KEY_PREFS = ("ch_names", "channel_names", "channels", "chan_names")
+_LABELS_KEY_PREFS = ("latent_dim_labels", "labels", "mode_labels",
+                    "dim_labels")
+
+
+def _looks_like_weights(arr) -> bool:
+    return (
+        hasattr(arr, "ndim") and arr.ndim == 2
+        and 3 <= arr.shape[0] <= 128
+        and 1 <= arr.shape[1] <= 64
+        and getattr(arr.dtype, "kind", "") in "fiu"
+    )
+
+
+def _introspect_npz(path: str, max_bytes: int = 20 * 1024 * 1024):
+    """Busca en un .npz una matriz (n_ch, n_modes) + nombres de canales.
+
+    Devuelve dict con claves 'w', 'c', 'l' (o None si no parece de
+    influencia).  Llamar solo con .npz SIN 'common' en el nombre (los
+    common_channel_influence_data.npz son los modos comunes, no los
+    especificos) y con tama~o razonable (para no cargar cdhsa_arrays.npz).
+    """
+    try:
+        if os.path.getsize(path) > max_bytes:
+            return None
+        data = np.load(path, allow_pickle=True)
+        keys = list(data.keys())
+    except Exception:
         return None
-    return m.group(1)
+
+    w_key = next((k for k in _WEIGHT_KEY_PREFS if k in keys), None)
+    if w_key is None:
+        for k in keys:
+            try:
+                if _looks_like_weights(data[k]):
+                    w_key = k
+                    break
+            except Exception:
+                continue
+    if w_key is None or not _looks_like_weights(data[w_key]):
+        return None
+    n_ch = int(data[w_key].shape[0])
+
+    c_key = next((k for k in _CHNAMES_KEY_PREFS if k in keys), None)
+    if c_key is None:
+        for k in keys:
+            try:
+                v = data[k]
+            except Exception:
+                continue
+            if (getattr(v, "dtype", None) is not None
+                    and v.dtype.kind in "OU"
+                    and v.ndim == 1 and v.shape[0] == n_ch):
+                c_key = k
+                break
+    if c_key is None:
+        return None
+
+    l_key = next((k for k in _LABELS_KEY_PREFS if k in keys), None)
+    return {"w": w_key, "c": c_key, "l": l_key}
+
+
+def _introspect_analysis_json(path: str):
+    """Fallback: pesos guardados dentro de un analysis.json (listas)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    w_key = next((k for k in _WEIGHT_KEY_PREFS
+                  if isinstance(data.get(k), list)
+                  and len(data[k]) > 0
+                  and isinstance(data[k][0], list)), None)
+    if w_key is None:
+        return None
+    try:
+        W = np.asarray(data[w_key], dtype=float)
+    except Exception:
+        return None
+    if W.ndim != 2 or not (3 <= W.shape[0] <= 128
+                           and 1 <= W.shape[1] <= 64):
+        return None
+    c_key = next((k for k in _CHNAMES_KEY_PREFS
+                  if isinstance(data.get(k), list)
+                  and len(data[k]) == W.shape[0]
+                  and all(isinstance(s, str) for s in data[k])), None)
+    if c_key is None:
+        return None
+    l_key = next((k for k in _LABELS_KEY_PREFS
+                  if isinstance(data.get(k), list)), None)
+    return {"w": w_key, "c": c_key, "l": l_key}
+
+
+def _discover_targets(root: str):
+    """Encuentra los archivos con datos de influencia bajo la raiz.
+
+    Devuelve (targets, fuente); cada target es (path, kind, keys) con
+    kind in {'npz', 'json'}.  Orden: nombre canonico del pipeline ->
+    introspeccion de .npz -> analysis.json.
+    """
+    strict = sorted(glob.glob(
+        os.path.join(root, "**", "channel_influence_data.npz"),
+        recursive=True))
+    if strict:
+        keys = {"w": "influence_weights", "c": "ch_names",
+                "l": "latent_dim_labels"}
+        return [(p, "npz", keys) for p in strict], "channel_influence_data.npz"
+
+    found = []
+    for p in sorted(glob.glob(os.path.join(root, "**", "*.npz"),
+                              recursive=True)):
+        if "common" in os.path.basename(p).lower():
+            continue
+        keys = _introspect_npz(p)
+        if keys:
+            found.append((p, "npz", keys))
+    if found:
+        return found, "introspeccion .npz"
+
+    found = []
+    for p in sorted(glob.glob(os.path.join(root, "**", "analysis.json"),
+                              recursive=True)):
+        keys = _introspect_analysis_json(p)
+        if keys:
+            found.append((p, "json", keys))
+    if found:
+        return found, "analysis.json"
+
+    return [], None
+
+
+def _load_influence(path: str, kind: str, keys: dict):
+    """Carga (W, ch_names, old_labels) desde .npz o analysis.json."""
+    if kind == "npz":
+        data = np.load(path, allow_pickle=True)
+        W = np.asarray(data[keys["w"]], dtype=float)
+        ch_names = [str(c) for c in data[keys["c"]]]
+        l_key = keys.get("l")
+        try:
+            old_labels = [str(c) for c in data[l_key]] if l_key else None
+        except KeyError:
+            old_labels = None
+    else:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        W = np.asarray(data[keys["w"]], dtype=float)
+        ch_names = [str(c) for c in data[keys["c"]]]
+        l_key = keys.get("l")
+        old_labels = ([str(c) for c in data[l_key]]
+                      if l_key and isinstance(data.get(l_key), list)
+                      else None)
+    if old_labels is None:
+        old_labels = ["?"] * (W.shape[1] if W.ndim == 2 else 0)
+    return W, ch_names, old_labels
+
+
+def _print_tree_hint(root: str) -> None:
+    """Diagnostico: mostrar que hay en la raiz (para poder reportarlo)."""
+    try:
+        sub = sorted(os.listdir(root))
+    except OSError:
+        return
+    print("  [i] Contenido de la raiz (para diagnosticar):")
+    for s in sub[:12]:
+        p = os.path.join(root, s)
+        print(f"      - {s}{'/' if os.path.isdir(p) else ''}")
+    first_dir = next((os.path.join(root, s) for s in sub
+                      if os.path.isdir(os.path.join(root, s))), None)
+    if first_dir:
+        try:
+            inner = sorted(os.listdir(first_dir))
+        except OSError:
+            return
+        print(f"      contenido de {os.path.basename(first_dir)}/:")
+        for s in inner[:20]:
+            print(f"        - {s}")
 
 
 # ---------------------------------------------------------------------------
@@ -228,30 +442,29 @@ def process_root(root: str, args) -> int:
     print("=" * 78)
     print(f"ROOT: {root}")
     print("=" * 78)
-    pattern = os.path.join(root, "**", "channel_influence_data.npz")
-    npz_files = sorted(glob.glob(pattern, recursive=True))
-    if not npz_files:
-        print("  [!] No se encontro ningun channel_influence_data.npz "
-              "debajo de esta raiz.")
+    targets, source = _discover_targets(root)
+    if not targets:
+        print("  [!] No se encontro ningun dato de influencia "
+              "(channel_influence_data.npz ni equivalente) debajo de esta "
+              "raiz.")
+        _print_tree_hint(root)
         return 0
+    if source != "channel_influence_data.npz":
+        print(f"  [i] Datos encontrados via: {source}")
 
     n_done = 0
-    for npz_path in npz_files:
-        job_dir = os.path.dirname(npz_path)
+    for data_path, kind, keys in targets:
+        job_dir = os.path.dirname(data_path)
         cond = condition_from_dirname(job_dir)
         ss = None
         for part in job_dir.split(os.sep):
             if part.startswith("super_subject"):
                 ss = part
                 break
+        if ss is None:
+            ss = _ss_label_from_dirname(job_dir)
 
-        data = np.load(npz_path, allow_pickle=True)
-        W = data["influence_weights"]
-        ch_names = [str(c) for c in data["ch_names"]]
-        try:
-            old_labels = [str(c) for c in data["latent_dim_labels"]]
-        except KeyError:
-            old_labels = ["?"] * W.shape[1]
+        W, ch_names, old_labels = _load_influence(data_path, kind, keys)
 
         # --- lambdas: mode_map > manual > ninguna -------------------------
         lams = None
@@ -266,7 +479,7 @@ def process_root(root: str, args) -> int:
             lam_src = "manual"
 
         rel = os.path.relpath(job_dir, root)
-        print(f"\n[{ss or '?'}] {rel}")
+        print(f"\n[{ss or '?'}] {rel}  ({os.path.basename(data_path)})")
         print(f"  condicion={cond}  modos={W.shape[1]}  "
               f"canales={W.shape[0]}  etiquetas_previas={old_labels}")
         print(f"  lambda={lams if lams else 'n/d'} (fuente: {lam_src})")
@@ -304,16 +517,19 @@ def process_root(root: str, args) -> int:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         description="Regenera los topoplots de influencia de canales sobre "
-                    "los modos especificos (D) desde los .npz ya guardados.",
+                    "los modos especificos (D) desde los datos ya guardados. "
+                    "Soporta los runs reales (fase latente) y el control "
+                    "task-shuffle (channel_influence_taskshuf<seed>).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("roots", nargs="+",
-                   help="raiz(es) de resultados (p.ej. la carpeta "
-                        "test_retest_gedai_super_subject_ec_mu descargada); "
-                        "se busca **/channel_influence_data.npz")
+                   help="raiz(es) de resultados; se busca "
+                        "**/channel_influence_data.npz. Control: "
+                        ".../from..s_.._taskshuf<seed>/"
+                        "channel_influence_taskshuf<seed>")
     p.add_argument("--mode-map", default=None,
-                   help="mode_map.json del experimento (para poner lambda=... "
-                        "en cada panel; las claves son las tareas)")
+                   help="mode_map.json (para poner lambda=... en cada panel; "
+                        "las claves son las condiciones/celdas nominales)")
     p.add_argument("--lambdas", default=None,
                    help="lambdas manuales separadas por coma (fallback si no "
                         "esta el mode_map), p.ej. 0.998,0.997,0.997,0.997")
