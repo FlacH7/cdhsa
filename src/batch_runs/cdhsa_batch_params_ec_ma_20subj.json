@@ -1,0 +1,109 @@
+{
+  "experiment_label": "multiss_cdhsa_20sub_1per300s_v5_r0cap5_var99c100",
+  "_comment_experiment": "CD-HSA multi-SS con sujetos individuales (S=20, C=2): sujetos 1..20, UN sujeto por unidad de analisis (sin concatenar) y ventana completa 0-300 s por grabacion. Resto de hiperparametros CONGELADOS respecto a multiss_cdhsa_5ss_v5_r0cap5_var99c100 (5 SS x 12 subj, session2, [100-200] s): mismo presupuesto de datos (20x300 = 5x12x100 = 6000 subject-segundos por condicion) pero 20 replicas reales en vez de 5 super-sujetos, para que el paso D (Delta_loso, Def. 3.15) sea directamente comparable. v5: a6_max_common=5 y var_max_rank=100 (re-entreno r0-fix; ver _comment_v5).",
+
+  "_comment_v5": "Re-entreno r0-fix (post-mortem 2026-10-19). (1) a6_max_common=5: A6 testea solo los 5 primeros candidatos y r0 queda acotado a 5 — fix de la canibalizacion (con a6_max_common=0 el nulo Haar liberal + espectro saturado declaraba comunes las 30 direcciones del pool: r0=30 censurado, y W0 se tragaba la banda ~1-2%/modo donde vive lo discriminativo). El pool de A1-A5 se sigue computando con el tope por defecto (max_common=30); lo que se acota es la decision de A6. (2) var_max_rank=100: los rangos locales quedaron censurados 10/10 a cap 50 (sin garantia de 99%, quizas ni 90%, de varianza) y la banda especifica ni entraba en las bases locales; con 100 el Step D tiene de donde elegir. AVISOS: el warning 'r0 = max_common, el backbone esta censurado' es ESPERADO (truncamiento deliberado); el Step B opera sobre W0 => testea solo 5 modos comunes (los F-tests de W6+ del baseline quedan en los logs viejos); d_loso=true es el gate pre-registrado del experimento: si el fix funciona, el LOSO debe volver positivo — si la clasificacion mejora pero el LOSO sigue <=0, la causa seria H2 (generalizacion sesion->sesion), no canibalizacion.",
+
+  "super_subjects": {
+    "n_super_subjects": 20,
+    "subjects_per_super_subject": 1,
+    "subject_start_offset": 1,
+    "total_subjects": 20
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "mathematic"],
+
+  "time_window": {
+    "t_start": 0.0,
+    "t_end": 300.0,
+    "_comment": "Ventana temporal POR SUJETO: grabacion completa (0-300 s). Las grabaciones mas cortas que 300 s se recortan solas a su duracion real (en mathematic/session2 hay grabaciones de 194-253 s). Con 1 sujeto por unidad no hay fronteras de concatenacion entre sujetos: la mascara de columnas de nivel 2 (no_boundary_mask=false) no descarta nada."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 20,
+    "rank_method": "variance",
+    "var_explained": 0.99,
+    "var_max_rank": 100,
+    "var_min_rank": 1,
+    "a6_max_common": 5,
+    "a6_null_type": "haar",
+    "a6_n_null": 200,
+    "bc_n_perm": 5000,
+    "tangent_blocks_mode": "cumulative",
+    "d_max_specific": 16,
+    "d_rank_adaptive": true,
+    "d_n_null_specific": 200,
+    "d_alpha_specific": 0.05,
+    "d_loso": true,
+    "d_loso_n_perm": 1000,
+    "run_replica_consistency": true,
+    "no_boundary_mask": false,
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "_comment_costs": "Coste v5: A6 testea 5 candidatos (~6x mas barato que el baseline de 30); el sobrecoste de var_max_rank=100 cae en A2 (svds hasta 100 triplets en vez de 50, ~2x esa fase) y en el tangente (~1.5-2x): espere ~1.3-1.8x el wall-clock del baseline (~13 h/experimento, en paralelo como siempre). Si el summary vuelve a reportar censo a cap 100, las bases locales siguen sin llegar al 99%: sopesar subir mas (coste ~cuadratico y cada dimension extra anade ruido especifico por sujeto al pool del Step D). El nulo 'hankel' (a6_null_type) cuesta ~10-15 min POR replica en este protocolo: usar solo para la comparacion final del paper con pocas replicas (20-100) o planificar n_null=500+ para la inferencia final.",
+    "_comment_nulos": "Para la comparacion Haar vs Hankel-preservante prometida en la Seccion 7: cambiar a6_null_type a 'hankel' (el pipeline autodetecta el row_block desde hankel_depth). NO cambiar de nulo a mitad de un analisis: declararlo a priori como en el paper."
+  },
+
+  "latent_plots": {
+    "enabled": true,
+    "_comment": "Fase posterior al CD-HSA + extraccion de modos: espacio latente + TODOS los plots previos al KM (incluida la influencia de los canales originales sobre cada dimension latente), SIN coeficientes de Kramers-Moyal ni potenciales. Los paths de mode_map_path/npz_path se AUTO-INYECTAN desde los resultados de esta misma corrida (no hacen falta ${VAR} ni entradas nuevas en el .env). Requiere modo multi-SS (n_super_subjects).",
+
+    "pipeline_module": "src.pipelines.latent_space_plots_from_eeg_gedai_super_subject",
+
+    "methods": [
+      {
+        "label": "hankel+cdhsa+top_4",
+        "_comment": "stage1_params.depth se auto-inyecta desde cdhsa_params.hankel_depth si se omite. mode_map_path/npz_path se auto-inyectan; si los pones aqui a mano, ganan sobre los auto-inyectados.",
+        "stage1_embedding": "hankel",
+        "stage1_params": {"depth": 10},
+        "stage2_dynamics": "cdhsa_specific_modes",
+        "stage2_params": {},
+        "stage3_selection": "top_n",
+        "stage3_params": {}
+      }
+    ],
+
+    "shared_params": {
+      "latent_dim": 4,
+      "l_freq": 1.0,
+      "h_freq": 40.0,
+      "ica_method": "picard",
+      "analysis_dim": null,
+      "column": null,
+      "workers": null,
+      "hankel_embedding_depth": null,
+      "verbose": true,
+      "ignore_cache": false,
+      "_comment_shared": "l_freq/h_freq por defecto toman los valores de cdhsa_params si se omiten. latent_dim=4 y top_n del mode_map (mode_extract_top_n) deben ser coherentes."
+    },
+
+    "execution": {
+      "max_workers": 4,
+      "delay": 2.0,
+      "_comment_exec": "max_workers=4 (antes 1): con unidades de 1 sujeto cada job latente materializa un block-Hankel de ~150k columnas (~3-7 GB peak RSS), no los 25-35 GB de las unidades de 12 sujetos; 4 jobs en paralelo caben con holgura y los 40 jobs (20 subj x 2 tareas) bajan de ~4 h a ~1 h."
+    },
+
+    "common_mode_analysis": {
+      "enabled": true,
+      "top_k_series": 12,
+      "top_k_topo": 8,
+      "chunk_cols": 50000,
+      "save_projection": true,
+      "_comment_cma": "v5.2: ANTES de los plots de modos especificos, proyecta el subespacio comun W0 (A6) sobre la grabacion SS x tarea: series temporales de los modos comunes dominantes (common_mode_projection.png), varianza explicada por modo + acumulada con contraste especifico (common_variance_explained.png), e influencia de los canales ORIGINALES sobre TODOS los modos comunes (common_channel_influence.png + _topo.png + _data.npz). Metricas numericas en common_mode_analysis.json. La extraccion latente NO cambia (spec_hash intacto -> cache npz reutilizado). Activar esto CAMBIA la checkpoint key latente (token cma1): los jobs ya completados se re-ejecutan en modo cache-hit (barato) para generar los nuevos artefactos."
+    }
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4
+  }
+}

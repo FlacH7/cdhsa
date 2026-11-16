@@ -71,7 +71,7 @@
   },
 
   "latent_plots": {
-    "enabled": false,
+    "enabled": true,
     "_comment": "OFF para el control negativo (obligatorio): la fase latente re-carga por tarea y reconstruiria SS distintos a los del run permutado. Las imagenes equivalentes (comunes + especificos por SS) las genera la fase de figuras del bloque ss_shuffle desde las celdas PERMUTADAS, que es lo correcto para el control."
   },
 
