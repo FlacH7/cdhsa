@@ -1,0 +1,82 @@
+{
+  "experiment_label": "multiss_cdhsa_20sub_taskshuffle_control_seed20261123",
+
+  "_comment_experiment": "CONTROL NEGATIVO (task-shuffle) del run real multiss_cdhsa_20sub_1per300s_v5_r0cap5_var99c100 (session1, sujetos 1..20, 0-300 s, v5: a6_max_common=5 + var_max_rank=100): es el nulo companero de ESE run. MISMOS sujetos, misma ventana, mismos hiperparametros CONGELADOS — la UNICA diferencia es que al armar cada super-sujeto (= 1 sujeto, C=2 celdas) las 2 grabaciones de cada sujeto se reparten ALEATORIAMENTE entre las 2 celdas (permutacion within-subject, seed fija 20261123, asignacion determinista trazable en hankel_info.json): se destruye el enlace condicion<->datos conservando exactamente los mismos datos. CONTRASTE PRE-REGISTRADO: si el hallazgo del run real (Delta_loso mathematic = 0.0006, p = 0.018) es biologia y no maquinaria, en este control DEBE morir: Delta_loso ~ 0 con p grande en ambas condiciones, F-tests del Step B ~ 1 (eta2 ~ 0), tangente no significativo, y el backbone comparable al real (r0=5; mismas grabaciones re-etiquetadas). Si algo de esto se dispara en el control, el 'hallazgo' del run real es artefacto del metodo, no senal.",
+
+  "super_subjects": {
+    "n_super_subjects": 20,
+    "subjects_per_super_subject": 1,
+    "subject_start_offset": 1,
+    "total_subjects": 20,
+    "task_shuffle": {
+      "enabled": true,
+      "seed": 20261123,
+      "extract_modes": true,
+      "_comment": "Control negativo: permutacion within-subject de las tareas al armar los SS. Ausente o enabled=false => comportamiento historico exacto (sin permutar, run real). Con 1 sujeto por SS la permutacion es un swap eyesclosed<->mathematic dentro de cada sujeto (20 swaps Bernoulli con esta seed). La seed genera la asignacion determinista y reproducible; el out_dir y la checkpoint key reciben el token taskshuf{seed} (no colisionan con el run real ni con el control v4 de 5 SS, seed 20261022). extract_modes=true: el mode_map del control se genera al final del batch con sufijo taskshuf{seed} (etiquetas de condicion NOMINALES: cada 'celda' es una mezcla aleatoria de tareas — sirve para inspeccion del control, NO como mapa por tarea)."
+    }
+  },
+
+  "ss_shuffle": {
+    "enabled": true,
+    "root_name": "ss_shufle",
+    "reuse_existing_run": true,
+    "reuse_copy": false,
+    "influence_figures": true,
+    "figures_force": false,
+    "figures_no_topo": false,
+    "_comment": "AISLAMIENTO TOTAL del control negativo (TODO-EN-UNO, cero colision con el experimento real): enabled=true redirige TODO lo que va en results/cache/params a <base>/ss_shufle/ (results/ss_shufle/, cache/ss_shufle/, params/ss_shufle/) y exporta BASE_* al entorno para que todos los subprocesos escriban ahi (el .env NO se toca). El checkpoint del batch tambien vive en cache/ss_shufle/ => nunca puede pisar/reusar el checkpoint del run real. reuse_existing_run=true: ANTES de computar intenta migrar un run previo del control que ya exista en el arbol real (results/cdhsa/..._taskshuf20261123) al arbol aislado — guardia paranoica: solo se toca un directorio cuyo nombre termina EXACTAMENTE en _taskshuf20261123; como la seed es nueva, aqui no hay nada que migrar y es un no-op seguro (queda por si se re-corre despues de una interrupcion). influence_figures=true: fase final que genera las imagenes de influencia de los canales originales sobre los modos COMUNES (W0/A6) y los ESPECIFICOS (Step D) de cada (SS, celda), desde las celdas PERMUTADAS con las que el control entreno (channel_influence_taskshuf20261123/ dentro del results-dir del control) — es el equivalente correcto de la fase latente/plots del run real, que para el control va OFF. figures_force=true las regenera aunque existan; figures_no_topo=true desactiva los topoplots."
+  },
+
+  "sessions": ["session1"],
+
+  "tasks": ["eyesclosed", "mathematic"],
+
+  "time_window": {
+    "t_start": 0.0,
+    "t_end": 300.0,
+    "_comment": "IDENTICA al run real: ventana temporal por sujeto, grabacion completa 0-300 s (las mas cortas se recortan solas a su duracion real). Con 1 sujeto por unidad no hay fronteras de concatenacion y la mascara de columnas de nivel 2 no descarta nada. El control debe ver EXACTAMENTE los mismos datos que el run real — solo re-etiquetados."
+  },
+
+  "cdhsa_params": {
+    "L": 10,
+    "hankel_depth": 10,
+    "l_freq": 1.0,
+    "h_freq": 40.0,
+    "fixed_rank": 20,
+    "rank_method": "variance",
+    "var_explained": 0.99,
+    "var_max_rank": 100,
+    "var_min_rank": 1,
+    "a6_max_common": 5,
+    "a6_null_type": "haar",
+    "a6_n_null": 200,
+    "bc_n_perm": 5000,
+    "tangent_blocks_mode": "cumulative",
+    "d_max_specific": 16,
+    "d_rank_adaptive": true,
+    "d_n_null_specific": 200,
+    "d_alpha_specific": 0.05,
+    "d_loso": true,
+    "d_loso_n_perm": 1000,
+    "run_replica_consistency": true,
+    "no_boundary_mask": false,
+    "skip_bc": false,
+    "skip_tangent": false,
+    "skip_d": false,
+    "_comment_costs": "Params v5 CONGELADOS — identicos al run real que acompana (multiss_cdhsa_20sub_1per300s_v5_r0cap5_var99c100): el control debe replicar la maquinaria TAL CUAL de ese run (a6_max_common=5, var_max_rank=100), no la del v4 (el control viejo de 5 SS replicaba el v4 porque acompanaba al v4). Coste esperado: igual al trabajo CD-HSA del run real (~26 h de wall-clock, ~31 GB de peak RSS para el job principal); la fase latente NO corre en el control (40 jobs menos), y la fase de figuras de influencia anade minutos. NO cambiar estos parametros sin cambiar tambien la seed: el out_dir codifica config+seed y el reuso solo aplica cuando la configuracion produce el MISMO directorio.",
+    "_comment_nulos": "Mismo nulo Haar del run real (a6_null_type=haar, n=200) para que A6/r0 sean directamente comparables con el run real (r0=5, lambda 0.9991-0.9998). El nulo 'hankel' queda reservado para la comparacion final de la Seccion 7, como en los runs reales."
+  },
+
+  "latent_plots": {
+    "enabled": false,
+    "_comment": "OFF para el control negativo — OBLIGATORIO: el runner RECHAZA task_shuffle + latent_plots.enabled=true (la fase latente re-carga por tarea y reconstruira SS distintos a los del run permutado; los modos especificos del control no tienen interpretacion dinamica). Las imagenes equivalentes (influencia de canales sobre modos comunes + especificos por SS, desde las celdas PERMUTADAS) las genera la fase influence_figures del bloque ss_shuffle, que es lo correcto para el control."
+  },
+
+  "execution": {
+    "max_workers": 1,
+    "delay": 0.0,
+    "run_comparison": false,
+    "mode_extract_top_n": 4,
+    "_comment_exec": "max_workers=1 (un unico job multi-SS, como el run real). mode_extract_top_n=4 (igual que el run real, y >0 requerido por influence_figures): con task_shuffle.extract_modes=true el mode_map del control se extrae al final del batch con el token taskshuf20261123 en el nombre (params/ss_shufle/). run_comparison=false: el control no se compara con nada dentro del script — la comparacion con el run real (session1 20 subj) es contra el summary ya calculado y la hace usted despues."
+  }
+}
